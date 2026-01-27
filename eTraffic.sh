@@ -1,10 +1,10 @@
 #!/bin/bash
 # ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v2.2 UI-Fix
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v2.3 Stable
 # 更新日志：
-# 1. 彻底修复仪表盘颜色乱码问题
-# 2. 引入方格表格 (Box Style) 样式，视觉更整洁
-# 3. 优化 grep 匹配逻辑，防止误读
+# 1. 修复：表格表头改为英文，完美解决中英文混合导致的对齐错乱
+# 2. 优化：支持空格分隔输入 (如 80 100 24)，无需输入冒号
+# 3. 视觉：重新调整边框样式，更加整洁
 # ==============================================================
 
 # --- 全局路径配置 ---
@@ -13,7 +13,7 @@ CONFIG_PATH="/etc/traffic_guard.conf"
 LOG_FILE="/var/log/traffic_guard.log"
 LOCK_DIR="/tmp/traffic_guard_locks"
 
-# --- 颜色定义 (用于 echo -e 或 printf %b) ---
+# --- 颜色定义 ---
 RES='\033[0m'
 RED='\033[31m'
 GREEN='\033[32m'
@@ -38,7 +38,7 @@ check_dependencies() {
     done
 }
 
-# 2. 生成核心监控脚本 (后台逻辑保持 v2.1 不变，稳定为主)
+# 2. 生成核心监控脚本 (保持核心逻辑稳定)
 create_monitor_script() {
     cat > "$INSTALL_PATH" << 'EOF'
 #!/bin/bash
@@ -81,6 +81,7 @@ init_chain() {
 
 get_bytes() {
     local port=$1
+    # 汇总 TCP 和 UDP 流量
     local v_in=$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_IN_$port" '$3 == t {sum+=$2} END {print sum+0}')
     local v_out=$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_OUT_$port" '$3 == t {sum+=$2} END {print sum+0}')
     echo $((${v_in:-0} + ${v_out:-0}))
@@ -127,6 +128,7 @@ if [ -f "$CONF_FILE" ]; then
     while read -r line; do
         [[ "$line" =~ ^#.*$ ]] && continue
         [ -z "$line" ] && continue
+        # 兼容处理：确保读取时只处理冒号分隔
         IFS=':' read -r port limit_gb block_hours <<< "$line"
         
         init_chain "$port"
@@ -160,7 +162,7 @@ EOF
     chmod +x "$INSTALL_PATH"
 }
 
-# 3. 功能：美化版实时仪表盘
+# 3. 功能：对齐修复版仪表盘
 show_status() {
     if [ ! -f "$CONFIG_PATH" ]; then
         echo -e "${RED}未找到配置文件，请先安装监控！${RES}"
@@ -169,12 +171,12 @@ show_status() {
 
     echo -e "${BOLD}正在获取实时数据...${RES}"
     
-    # 定义分隔线
-    SEP="+----------+-----------------+-----------------+------------+------------+"
+    # 定义分隔线 (使用 ASCII 字符以保证对齐)
+    SEP="+----------+----------------+----------------+----------+------------+"
     
-    # 打印表头
+    # 打印表头 (改用英文以解决宽度不一致问题)
     echo "$SEP"
-    printf "| %-8s | %-15s | %-15s | %-10s | %-10s |\n" "端口" "已用流量" "流量上限" "使用率" "状态"
+    printf "| %-8s | %-14s | %-14s | %-8s | %-10s |\n" " PORT" " USED" " LIMIT" " USAGE" " STATUS"
     echo "$SEP"
 
     while read -r line; do
@@ -204,39 +206,45 @@ show_status() {
             percent="0"
         fi
 
-        # 状态判定与颜色
-        # 技巧：将颜色代码独立出来，不影响 printf 宽度计算
+        # 状态判定
         if [ -f "$LOCK_DIR/$port.lock" ]; then
-            status_txt="已封锁"
+            status_txt="BLOCKED"
             color_code="${RED}"
         else
-            status_txt="正常"
+            status_txt="ACTIVE"
             color_code="${GREEN}"
         fi
         
-        # 打印行：注意 %b 用于解析颜色变量，%-10s 用于对齐文本，${RES} 重置颜色
-        printf "| %-8s | %-15s | %-15s | %-10s | %b%-10s%b |\n" \
-            "$port" "$used_human $used_unit" "${limit_gb} GB" "$percent%" "$color_code" "$status_txt" "${RES}"
+        # 打印行：全英文数据保证 100% 对齐
+        printf "| %-8s | %-14s | %-14s | %-8s | %b%-10s%b |\n" \
+            " $port" " $used_human $used_unit" " ${limit_gb} GB" " $percent%" "$color_code" " $status_txt" "${RES}"
             
         echo "$SEP"
 
     done < "$CONFIG_PATH"
-    echo -e "${BLUE}提示：数据基于 iptables 实时采集，每分钟自动执行封锁/解封判定。${RES}"
 }
 
-# 4. 安装流程
+# 4. 安装流程 (支持空格输入)
 install_monitor() {
     check_dependencies
     echo "-------------------------------------"
     echo -e "${YELLOW}请配置监控规则${RES}"
-    echo "格式: 端口号:流量上限(GB):超标封锁时长(小时)"
-    echo "示例: 8080:500:24"
+    echo "输入格式: 端口 流量上限(GB) 封锁时长(小时)"
+    echo "说明: 可以用空格隔开，更加方便！"
+    echo -e "示例: ${BOLD}8080 500 24${RES}"
     echo "-------------------------------------"
-    read -p "请输入规则 (默认为 80:100:24): " user_rule
-    [ -z "$user_rule" ] && user_rule="80:100:24"
+    read -p "请输入规则: " input_rule
+    
+    # 处理逻辑：如果用户输入为空，使用默认值
+    if [ -z "$input_rule" ]; then
+        user_rule="80:100:24"
+    else
+        # 核心修改：将所有空格替换为冒号
+        user_rule="${input_rule// /:}"
+    fi
     
     echo "$user_rule" > "$CONFIG_PATH"
-    echo -e "${GREEN}配置已保存。${RES}"
+    echo -e "${GREEN}配置已解析并保存: $user_rule${RES}"
     
     create_monitor_script
     echo -e "${GREEN}核心脚本已生成。${RES}"
@@ -276,7 +284,7 @@ uninstall_monitor() {
 while true; do
     clear
     echo -e "${BLUE}==============================================${RES}"
-    echo -e "${BOLD}    VPS 流量监控管家 (Traffic Guard v2.2)${RES}"
+    echo -e "${BOLD}    VPS 流量监控管家 (Traffic Guard v2.3)${RES}"
     echo -e "${BLUE}==============================================${RES}"
     echo " 1. 安装/重置监控 (Install)"
     echo " 2. 编辑监控规则 (Nano)"
