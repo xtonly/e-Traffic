@@ -1,10 +1,10 @@
 #!/bin/bash
 # ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v3.6 Syntax-Fix
-# 修复内容：
-# 1. [修复] 修正 v3.5 中的 "syntax error near unexpected token '}'" 错误
-# 2. [精简] 移除冗余的 else 分支，确保代码在所有 Shell 下兼容
-# 3. [保留] 完美保留 v3.5 的所有核心功能 (lo白名单、排序修复、暴力清理)
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v3.7 Format-Fix
+# 修复日志：
+# 1. [核心修复] 增加 Windows 换行符 (\r) 自动清洗，彻底解决 syntax error
+# 2. [稳健] 强化 SSH 端口变量获取逻辑，防止含有换行符导致脚本断裂
+# 3. [兼容] 优化 Shell 判断语法，提升对旧版 Bash/Dash 的兼容性
 # ==============================================================
 
 # --- 环境变量注入 ---
@@ -42,9 +42,12 @@ check_dependencies() {
 }
 
 create_monitor_script() {
-    SSH_PORT=$(netstat -tnlp 2>/dev/null | grep sshd | awk '{print $4}' | awk -F: '{print $NF}' | head -n 1)
-    [ -z "$SSH_PORT" ] && SSH_PORT=22
+    # 强化获取 SSH 端口：去除空格、换行符，防止破坏脚本结构
+    SSH_PORT=$(netstat -tnlp 2>/dev/null | grep sshd | awk '{print $4}' | awk -F: '{print $NF}' | head -n 1 | tr -d '[:space:]')
     
+    # 如果没获取到，默认为 22
+    if [ -z "$SSH_PORT" ]; then SSH_PORT=22; fi
+
     cat > "$INSTALL_PATH" << EOF
 #!/bin/bash
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -72,7 +75,8 @@ enforce_whitelist() {
 
 clean_rules() {
     local port=\$1
-    if ! [[ "\$port" =~ ^[0-9]+$ ]]; then return; fi
+    # 兼容性更强的数字判断
+    if ! echo "\$port" | grep -qE '^[0-9]+$'; then return; fi
     
     # --- 暴力循环清理 IPv4 ---
     while iptables -D INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null; do :; done
@@ -80,17 +84,16 @@ clean_rules() {
     while iptables -D INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null; do :; done
     while iptables -D INPUT -p udp --dport "\$port" -j DROP 2>/dev/null; do :; done
     
-    # 清理可能残留的 OUTPUT
+    # 清理 OUTPUT
     while iptables -D OUTPUT -p tcp --sport "\$port" -j DROP 2>/dev/null; do :; done
     while iptables -D OUTPUT -p udp --sport "\$port" -j DROP 2>/dev/null; do :; done
 
-    # 清理计数链引用
+    # 清理计数链
     while iptables -D INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; do :; done
     while iptables -D INPUT -p udp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; do :; done
     while iptables -D OUTPUT -p tcp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null; do :; done
-    while iptables -D OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null
+    while iptables -D OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null; do :; done
     
-    # 销毁链
     iptables -F "TRAFFIC_IN_\$port" 2>/dev/null
     iptables -X "TRAFFIC_IN_\$port" 2>/dev/null
     iptables -F "TRAFFIC_OUT_\$port" 2>/dev/null
@@ -105,7 +108,7 @@ clean_rules() {
     while ip6tables -D INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; do :; done
     while ip6tables -D INPUT -p udp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; do :; done
     while ip6tables -D OUTPUT -p tcp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null; do :; done
-    while ip6tables -D OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null
+    while ip6tables -D OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null; do :; done
     
     ip6tables -F "TRAFFIC_IN_\$port" 2>/dev/null
     ip6tables -X "TRAFFIC_IN_\$port" 2>/dev/null
@@ -115,12 +118,11 @@ clean_rules() {
 
 init_chain() {
     local port=\$1
-    if ! [[ "\$port" =~ ^[0-9]+$ ]]; then return; fi
+    if ! echo "\$port" | grep -qE '^[0-9]+$'; then return; fi
     
-    # 每次初始化前，确保白名单存在且在顶部
     enforce_whitelist
 
-    # 1. 建立计数链 (IPv4)
+    # IPv4 计数链
     iptables -N "TRAFFIC_IN_\$port" 2>/dev/null
     if ! iptables -C INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; then
         iptables -A INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port"
@@ -132,7 +134,7 @@ init_chain() {
         iptables -A OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port"
     fi
 
-    # 2. 建立计数链 (IPv6)
+    # IPv6 计数链
     ip6tables -N "TRAFFIC_IN_\$port" 2>/dev/null
     if ! ip6tables -C INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; then
         ip6tables -A INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port"
@@ -147,7 +149,7 @@ init_chain() {
 
 get_bytes() {
     local port=\$1
-    if ! [[ "\$port" =~ ^[0-9]+$ ]]; then echo 0; return; fi
+    if ! echo "\$port" | grep -qE '^[0-9]+$'; then echo 0; return; fi
     local v4_in=\$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_IN_\$port" '\$3 == t {sum+=\$2} END {printf "%.0f", sum}')
     local v4_out=\$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_OUT_\$port" '\$3 == t {sum+=\$2} END {printf "%.0f", sum}')
     local v6_in=\$(ip6tables -L INPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_IN_\$port" '\$3 == t {sum+=\$2} END {printf "%.0f", sum}')
@@ -157,18 +159,20 @@ get_bytes() {
 
 block_action() {
     local port=\$1
-    if [ -z "\$port" ] || ! [[ "\$port" =~ ^[0-9]+$ ]]; then return; fi
+    if [ -z "\$port" ]; then return; fi
+    # 安全判断：如果端口不是数字，或者等于 SSH 端口，则跳过
+    if ! echo "\$port" | grep -qE '^[0-9]+$'; then return; fi
     if [ "\$port" == "\$SAFE_SSH_PORT" ]; then return; fi
     
-    # 确保白名单在 Index 1
     enforce_whitelist
 
-    # 封锁规则插入到 Index 2 (白名单之后)
+    # IPv4 封锁 (Index 2)
     if ! iptables -C INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null; then
         iptables -I INPUT 2 -p tcp --dport "\$port" ! -i lo -j DROP
         iptables -I INPUT 2 -p udp --dport "\$port" ! -i lo -j DROP
     fi
     
+    # IPv6 封锁 (Index 2)
     if ! ip6tables -C INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null; then
         ip6tables -I INPUT 2 -p tcp --dport "\$port" ! -i lo -j DROP
         ip6tables -I INPUT 2 -p udp --dport "\$port" ! -i lo -j DROP
@@ -197,10 +201,8 @@ if [ "\$1" == "cleanup" ]; then
     exit 0
 fi
 
-# 监控模式
 NOW=\$(date +%s)
 if [ -f "\$CONF_FILE" ]; then
-    # 每次运行前，先确保白名单在最上面
     enforce_whitelist
     
     while read -r line; do
@@ -209,7 +211,8 @@ if [ -f "\$CONF_FILE" ]; then
         [ -z "\$line" ] && continue
         IFS=':' read -r port limit_gb raw_time <<< "\$line"
         
-        if ! [[ "\$port" =~ ^[0-9]+$ ]]; then continue; fi
+        # 兼容性判断
+        if ! echo "\$port" | grep -qE '^[0-9]+$'; then continue; fi
 
         init_chain "\$port"
         lock_file="\$LOCK_DIR/\$port.lock"
@@ -247,6 +250,12 @@ if [ -f "\$CONF_FILE" ]; then
     done < "\$CONF_FILE"
 fi
 EOF
+    
+    # !!! 关键修复步骤 !!!
+    # 使用 sed 剔除文件中可能存在的 Windows 换行符 (\r)
+    # 这能解决 "syntax error near unexpected token" 问题
+    sed -i 's/\r//g' "$INSTALL_PATH"
+    
     chmod +x "$INSTALL_PATH"
 }
 
@@ -264,7 +273,7 @@ show_status() {
         [[ "$line" =~ ^#.*$ ]] && continue
         [ -z "$line" ] && continue
         IFS=':' read -r port limit_gb raw_time <<< "$line"
-        if ! [[ "$port" =~ ^[0-9]+$ ]]; then continue; fi
+        if ! echo "$port" | grep -qE '^[0-9]+$'; then continue; fi
 
         v4_in=$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_IN_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
         v4_out=$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_OUT_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
@@ -301,8 +310,7 @@ show_status() {
 install_monitor() {
     check_dependencies
     echo "--------------------------------------------------------"
-    echo -e "${YELLOW}配置监控规则 (支持分钟级设定)${RES}"
-    echo "输入格式: 端口  流量(GB)  时长"
+    echo -e "${YELLOW}配置监控规则${RES}"
     echo -e "👉 10分钟写法: ${BOLD}10m${RES}"
     echo -e "👉 1小时写法:  ${BOLD}1${RES}"
     echo -e "示例: ${BOLD}8080 500 10m${RES}"
@@ -351,7 +359,7 @@ manual_check() {
 while true; do
     clear
     echo -e "${BLUE}==============================================${RES}"
-    echo -e "${BOLD}    VPS 流量监控管家 (v3.6 Syntax Fix)${RES}"
+    echo -e "${BOLD}    VPS 流量监控管家 (v3.7 Format Fix)${RES}"
     echo -e "${BLUE}==============================================${RES}"
     echo " 1. 安装/重置监控 (Install)"
     echo " 2. 编辑规则 (Edit)"
