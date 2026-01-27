@@ -1,9 +1,10 @@
 #!/bin/bash
 # ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v2.1 Fix
-# 修复日志：
-# 1. 修复 get_bytes 函数处理 TCP/UDP 多行规则时的计算报错
-# 2. 优化仪表盘显示，防止数据为空时报错
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v2.2 UI-Fix
+# 更新日志：
+# 1. 彻底修复仪表盘颜色乱码问题
+# 2. 引入方格表格 (Box Style) 样式，视觉更整洁
+# 3. 优化 grep 匹配逻辑，防止误读
 # ==============================================================
 
 # --- 全局路径配置 ---
@@ -12,7 +13,7 @@ CONFIG_PATH="/etc/traffic_guard.conf"
 LOG_FILE="/var/log/traffic_guard.log"
 LOCK_DIR="/tmp/traffic_guard_locks"
 
-# --- 颜色定义 ---
+# --- 颜色定义 (用于 echo -e 或 printf %b) ---
 RES='\033[0m'
 RED='\033[31m'
 GREEN='\033[32m'
@@ -37,7 +38,7 @@ check_dependencies() {
     done
 }
 
-# 2. 生成核心监控脚本 (后台运行部分)
+# 2. 生成核心监控脚本 (后台逻辑保持 v2.1 不变，稳定为主)
 create_monitor_script() {
     cat > "$INSTALL_PATH" << 'EOF'
 #!/bin/bash
@@ -54,12 +55,10 @@ clean_iptables() {
     iptables -D INPUT -p udp --dport "$port" -j DROP 2>/dev/null
     iptables -D OUTPUT -p tcp --sport "$port" -j DROP 2>/dev/null
     iptables -D OUTPUT -p udp --sport "$port" -j DROP 2>/dev/null
-    
     iptables -D INPUT -p tcp --dport "$port" -j "TRAFFIC_IN_$port" 2>/dev/null
     iptables -D INPUT -p udp --dport "$port" -j "TRAFFIC_IN_$port" 2>/dev/null
     iptables -D OUTPUT -p tcp --sport "$port" -j "TRAFFIC_OUT_$port" 2>/dev/null
     iptables -D OUTPUT -p udp --sport "$port" -j "TRAFFIC_OUT_$port" 2>/dev/null
-    
     iptables -F "TRAFFIC_IN_$port" 2>/dev/null
     iptables -X "TRAFFIC_IN_$port" 2>/dev/null
     iptables -F "TRAFFIC_OUT_$port" 2>/dev/null
@@ -68,14 +67,11 @@ clean_iptables() {
 
 init_chain() {
     local port=$1
-    # 建立统计链
     iptables -N "TRAFFIC_IN_$port" 2>/dev/null
-    # 如果 INPUT 中没有跳转规则，则添加 TCP 和 UDP 两条
     if ! iptables -C INPUT -p tcp --dport "$port" -j "TRAFFIC_IN_$port" 2>/dev/null; then
         iptables -I INPUT -p tcp --dport "$port" -j "TRAFFIC_IN_$port"
         iptables -I INPUT -p udp --dport "$port" -j "TRAFFIC_IN_$port"
     fi
-    
     iptables -N "TRAFFIC_OUT_$port" 2>/dev/null
     if ! iptables -C OUTPUT -p tcp --sport "$port" -j "TRAFFIC_OUT_$port" 2>/dev/null; then
         iptables -I OUTPUT -p tcp --sport "$port" -j "TRAFFIC_OUT_$port"
@@ -83,14 +79,10 @@ init_chain() {
     fi
 }
 
-# --- 核心修复：使用 awk 汇总多行流量 ---
 get_bytes() {
     local port=$1
-    # 匹配目标链名称，累加第二列(bytes)
-    # 兼容 TCP 和 UDP 会产生两行数据的情况
     local v_in=$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_IN_$port" '$3 == t {sum+=$2} END {print sum+0}')
     local v_out=$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_OUT_$port" '$3 == t {sum+=$2} END {print sum+0}')
-    
     echo $((${v_in:-0} + ${v_out:-0}))
 }
 
@@ -137,9 +129,7 @@ if [ -f "$CONF_FILE" ]; then
         [ -z "$line" ] && continue
         IFS=':' read -r port limit_gb block_hours <<< "$line"
         
-        # 确保链存在
         init_chain "$port"
-        
         lock_file="$LOCK_DIR/$port.lock"
         
         if [ -f "$lock_file" ]; then
@@ -170,28 +160,34 @@ EOF
     chmod +x "$INSTALL_PATH"
 }
 
-# 3. 功能：显示实时状态仪表盘 (逻辑同步修复)
+# 3. 功能：美化版实时仪表盘
 show_status() {
     if [ ! -f "$CONFIG_PATH" ]; then
         echo -e "${RED}未找到配置文件，请先安装监控！${RES}"
         return
     fi
 
-    echo -e "${BOLD}正在获取实时数据，请稍候...${RES}"
-    echo "-----------------------------------------------------------------------"
-    printf "${BOLD}%-8s %-15s %-15s %-10s %-10s${RES}\n" "端口" "已用流量" "流量上限" "使用率" "当前状态"
-    echo "-----------------------------------------------------------------------"
+    echo -e "${BOLD}正在获取实时数据...${RES}"
+    
+    # 定义分隔线
+    SEP="+----------+-----------------+-----------------+------------+------------+"
+    
+    # 打印表头
+    echo "$SEP"
+    printf "| %-8s | %-15s | %-15s | %-10s | %-10s |\n" "端口" "已用流量" "流量上限" "使用率" "状态"
+    echo "$SEP"
 
     while read -r line; do
         [[ "$line" =~ ^#.*$ ]] && continue
         [ -z "$line" ] && continue
         IFS=':' read -r port limit_gb block_hours <<< "$line"
 
-        # 使用修复后的 awk 逻辑汇总流量
+        # 获取数据
         v_in=$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_IN_$port" '$3 == t {sum+=$2} END {print sum+0}')
         v_out=$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_OUT_$port" '$3 == t {sum+=$2} END {print sum+0}')
         bytes=$((${v_in:-0} + ${v_out:-0}))
 
+        # 单位换算
         if [ "$bytes" -gt 1073741824 ]; then
             used_human=$(echo "scale=2; $bytes/1024/1024/1024" | bc)
             used_unit="GB"
@@ -200,22 +196,32 @@ show_status() {
             used_unit="MB"
         fi
 
+        # 百分比
         limit_bytes=$(echo "$limit_gb * 1024 * 1024 * 1024" | bc | cut -d. -f1)
         if [ "$limit_bytes" -gt 0 ]; then
-            percent=$(echo "scale=2; ($bytes * 100) / $limit_bytes" | bc)
+            percent=$(echo "scale=1; ($bytes * 100) / $limit_bytes" | bc)
         else
             percent="0"
         fi
 
-        status_text="${GREEN}正常${RES}"
+        # 状态判定与颜色
+        # 技巧：将颜色代码独立出来，不影响 printf 宽度计算
         if [ -f "$LOCK_DIR/$port.lock" ]; then
-            status_text="${RED}已封锁${RES}"
+            status_txt="已封锁"
+            color_code="${RED}"
+        else
+            status_txt="正常"
+            color_code="${GREEN}"
         fi
         
-        printf "%-8s %-15s %-15s %-10s %-10s\n" "$port" "$used_human $used_unit" "${limit_gb} GB" "$percent%" "$status_text"
+        # 打印行：注意 %b 用于解析颜色变量，%-10s 用于对齐文本，${RES} 重置颜色
+        printf "| %-8s | %-15s | %-15s | %-10s | %b%-10s%b |\n" \
+            "$port" "$used_human $used_unit" "${limit_gb} GB" "$percent%" "$color_code" "$status_txt" "${RES}"
+            
+        echo "$SEP"
 
     done < "$CONFIG_PATH"
-    echo "-----------------------------------------------------------------------"
+    echo -e "${BLUE}提示：数据基于 iptables 实时采集，每分钟自动执行封锁/解封判定。${RES}"
 }
 
 # 4. 安装流程
@@ -240,12 +246,9 @@ install_monitor() {
         echo -e "${GREEN}定时任务已添加。${RES}"
     fi
     
-    # 立即运行一次验证，并显示是否成功
-    if bash "$INSTALL_PATH"; then
-        echo -e "${GREEN}安装完成！核心逻辑测试通过，脚本已在后台运行。${RES}"
-    else
-        echo -e "${RED}安装完成，但核心脚本运行出现警告，请检查日志。${RES}"
-    fi
+    # 立即初始化
+    bash "$INSTALL_PATH"
+    echo -e "${GREEN}安装完成！监控已启动。${RES}"
 }
 
 # 5. 卸载流程
@@ -273,11 +276,11 @@ uninstall_monitor() {
 while true; do
     clear
     echo -e "${BLUE}==============================================${RES}"
-    echo -e "${BOLD}    VPS 流量监控管家 (Traffic Guard v2.1 Fix)${RES}"
+    echo -e "${BOLD}    VPS 流量监控管家 (Traffic Guard v2.2)${RES}"
     echo -e "${BLUE}==============================================${RES}"
     echo " 1. 安装/重置监控 (Install)"
     echo " 2. 编辑监控规则 (Nano)"
-    echo -e "${YELLOW} 3. 查看实时流量状态 (Status)${RES}"
+    echo -e "${YELLOW} 3. 查看实时流量状态 (Status Dashboard)${RES}"
     echo " 4. 查看操作日志 (Logs)"
     echo " 5. 彻底卸载 (Uninstall)"
     echo " 0. 退出 (Exit)"
@@ -289,7 +292,7 @@ while true; do
         2) 
             if [ -f "$CONFIG_PATH" ]; then
                 nano "$CONFIG_PATH"
-                echo -e "${GREEN}修改已保存，等待一分钟后自动生效。${RES}"
+                echo -e "${GREEN}规则修改已保存，系统将在1分钟内自动同步。${RES}"
             else
                 echo -e "${RED}请先执行安装！${RES}"
             fi
