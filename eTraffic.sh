@@ -1,10 +1,10 @@
 #!/bin/bash
 # ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v2.5 BigNum-Fix
-# 更新日志：
-# 1. 修复：解决流量超过 2GB 后 awk 输出科学计数法导致脚本崩溃的问题
-# 2. 核心：get_bytes 函数强制转换为纯整数格式
-# 3. 继承：保留之前所有的交互式输入和 UI 美化功能
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v2.6 Security-Fix
+# 紧急修复：
+# 1. 增加“数字指纹校验”，防止因配置文件空行导致的“全端口误封”
+# 2. 增加 Windows 换行符自动清洗 (tr -d '\r')
+# 3. 封锁函数增加“空值熔断”机制，变量为空时拒绝执行 iptables
 # ==============================================================
 
 # --- 全局路径配置 ---
@@ -51,14 +51,19 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"; }
 
 clean_iptables() {
     local port=$1
+    # 安全检查：如果端口不是数字，直接退出，防止误删
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then return; fi
+    
     iptables -D INPUT -p tcp --dport "$port" -j DROP 2>/dev/null
     iptables -D INPUT -p udp --dport "$port" -j DROP 2>/dev/null
     iptables -D OUTPUT -p tcp --sport "$port" -j DROP 2>/dev/null
     iptables -D OUTPUT -p udp --sport "$port" -j DROP 2>/dev/null
+    
     iptables -D INPUT -p tcp --dport "$port" -j "TRAFFIC_IN_$port" 2>/dev/null
     iptables -D INPUT -p udp --dport "$port" -j "TRAFFIC_IN_$port" 2>/dev/null
     iptables -D OUTPUT -p tcp --sport "$port" -j "TRAFFIC_OUT_$port" 2>/dev/null
     iptables -D OUTPUT -p udp --sport "$port" -j "TRAFFIC_OUT_$port" 2>/dev/null
+    
     iptables -F "TRAFFIC_IN_$port" 2>/dev/null
     iptables -X "TRAFFIC_IN_$port" 2>/dev/null
     iptables -F "TRAFFIC_OUT_$port" 2>/dev/null
@@ -67,6 +72,9 @@ clean_iptables() {
 
 init_chain() {
     local port=$1
+    # 安全检查
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then return; fi
+
     iptables -N "TRAFFIC_IN_$port" 2>/dev/null
     if ! iptables -C INPUT -p tcp --dport "$port" -j "TRAFFIC_IN_$port" 2>/dev/null; then
         iptables -I INPUT -p tcp --dport "$port" -j "TRAFFIC_IN_$port"
@@ -81,7 +89,9 @@ init_chain() {
 
 get_bytes() {
     local port=$1
-    # 修复核心：使用 printf "%.0f" 强制 awk 输出完整整数，禁止科学计数法 (如 2.3e+09)
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then echo 0; return; fi
+    
+    # 使用 printf "%.0f" 强制转换为纯整数，防止科学计数法报错
     local v_in=$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_IN_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
     local v_out=$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_OUT_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
     echo $((${v_in:-0} + ${v_out:-0}))
@@ -89,11 +99,18 @@ get_bytes() {
 
 block_action() {
     local port=$1
+    # 熔断机制：如果端口为空或非数字，绝对不执行封禁
+    if [ -z "$port" ]; then return; fi
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then return; fi
+
     if ! iptables -C INPUT -p tcp --dport "$port" -j DROP 2>/dev/null; then
+        # 仅针对特定端口封禁，绝不封禁 ALL
         iptables -I INPUT 1 -p tcp --dport "$port" -j DROP
         iptables -I INPUT 1 -p udp --dport "$port" -j DROP
         iptables -I OUTPUT 1 -p tcp --sport "$port" -j DROP
         iptables -I OUTPUT 1 -p udp --sport "$port" -j DROP
+        
+        # 杀掉对应连接
         timeout 2 ss -K dport = :$port >/dev/null 2>&1
         log "ALERT: Port $port traffic limit exceeded. BLOCKED."
     fi
@@ -101,10 +118,13 @@ block_action() {
 
 unblock_action() {
     local port=$1
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then return; fi
+
     while iptables -D INPUT -p tcp --dport "$port" -j DROP 2>/dev/null; do :; done
     while iptables -D INPUT -p udp --dport "$port" -j DROP 2>/dev/null; do :; done
     while iptables -D OUTPUT -p tcp --sport "$port" -j DROP 2>/dev/null; do :; done
     while iptables -D OUTPUT -p udp --sport "$port" -j DROP 2>/dev/null; do :; done
+    
     clean_iptables "$port"
     init_chain "$port"
     log "INFO: Port $port restriction expired. UNBLOCKED and Counter RESET."
@@ -113,8 +133,11 @@ unblock_action() {
 if [ "$1" == "cleanup" ]; then
     if [ -f "$CONF_FILE" ]; then
         while read -r line; do
+            # 兼容性清洗
+            line=$(echo "$line" | tr -d '\r')
             [[ "$line" =~ ^#.*$ ]] && continue
             [ -z "$line" ] && continue
+            
             port=$(echo $line | awk -F: '{print $1}')
             clean_iptables "$port"
         done < "$CONF_FILE"
@@ -126,10 +149,18 @@ fi
 NOW=$(date +%s)
 if [ -f "$CONF_FILE" ]; then
     while read -r line; do
+        # 1. 剔除 Windows 换行符
+        line=$(echo "$line" | tr -d '\r')
+        
+        # 2. 跳过注释和空行
         [[ "$line" =~ ^#.*$ ]] && continue
         [ -z "$line" ] && continue
+        
         IFS=':' read -r port limit_gb block_hours <<< "$line"
         
+        # 3. 核心安全检查：如果端口不是数字，直接跳过本行
+        if ! [[ "$port" =~ ^[0-9]+$ ]]; then continue; fi
+
         init_chain "$port"
         lock_file="$LOCK_DIR/$port.lock"
         
@@ -161,7 +192,7 @@ EOF
     chmod +x "$INSTALL_PATH"
 }
 
-# 3. 功能：仪表盘 (同步应用大数修复)
+# 3. 功能：仪表盘 (同步安全修复)
 show_status() {
     if [ ! -f "$CONFIG_PATH" ]; then
         echo -e "${RED}未找到配置文件，请先安装监控！${RES}"
@@ -176,11 +207,16 @@ show_status() {
     echo "$SEP"
 
     while read -r line; do
+        # 这里的读取逻辑必须与后台脚本一致，否则显示会不准
+        line=$(echo "$line" | tr -d '\r')
         [[ "$line" =~ ^#.*$ ]] && continue
         [ -z "$line" ] && continue
+        
         IFS=':' read -r port limit_gb block_hours <<< "$line"
+        
+        # 忽略无效端口
+        if ! [[ "$port" =~ ^[0-9]+$ ]]; then continue; fi
 
-        # 修复：同样使用 printf "%.0f" 避免 UI 显示时的计算错误
         v_in=$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_IN_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
         v_out=$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_OUT_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
         bytes=$((${v_in:-0} + ${v_out:-0}))
@@ -232,7 +268,11 @@ install_monitor() {
         echo -e "${BLUE}>> 请输入规则 (直接回车表示录入结束):${RES}"
         read -p "> " input_rule
         if [ -z "$input_rule" ]; then break; fi
+        
+        # 即使输入时有多余空格或TAB，也在此处清洗
         clean_rule=$(echo "$input_rule" | tr -s ' ' ':')
+        
+        # 简单格式校验
         if [[ $(echo "$clean_rule" | grep -o ":" | wc -l) -lt 2 ]]; then
              echo -e "${RED}格式错误！请确保输入了三个参数 (端口 流量 时间)${RES}"
              continue
@@ -263,12 +303,16 @@ uninstall_monitor() {
     if [ -f "$INSTALL_PATH" ]; then
         bash "$INSTALL_PATH" cleanup
     else
+        # 备用清理：防止脚本文件丢失无法卸载
         if [ -f "$CONFIG_PATH" ]; then
              while read -r line; do
+                line=$(echo "$line" | tr -d '\r')
                 port=$(echo $line | awk -F: '{print $1}')
-                iptables -D INPUT -p tcp --dport "$port" -j DROP 2>/dev/null
-                iptables -D INPUT -p udp --dport "$port" -j DROP 2>/dev/null
-                iptables -D OUTPUT -p tcp --sport "$port" -j DROP 2>/dev/null
+                if [[ "$port" =~ ^[0-9]+$ ]]; then
+                    iptables -D INPUT -p tcp --dport "$port" -j DROP 2>/dev/null
+                    iptables -D INPUT -p udp --dport "$port" -j DROP 2>/dev/null
+                    iptables -D OUTPUT -p tcp --sport "$port" -j DROP 2>/dev/null
+                fi
              done < "$CONFIG_PATH"
         fi
     fi
@@ -282,7 +326,7 @@ uninstall_monitor() {
 while true; do
     clear
     echo -e "${BLUE}==============================================${RES}"
-    echo -e "${BOLD}    VPS 流量监控管家 (Traffic Guard v2.5)${RES}"
+    echo -e "${BOLD}    VPS 流量监控管家 (Traffic Guard v2.6)${RES}"
     echo -e "${BLUE}==============================================${RES}"
     echo " 1. 安装/重置监控 (Install - Multi Input)"
     echo " 2. 编辑监控规则 (Nano)"
