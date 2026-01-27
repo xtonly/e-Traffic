@@ -1,10 +1,10 @@
 #!/bin/bash
 # ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v2.4 Multi-Input
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v2.5 BigNum-Fix
 # 更新日志：
-# 1. 升级安装流程：支持连续录入多个端口规则 (循环交互模式)
-# 2. 输入容错：自动处理多余空格 (如 "80   100 24" -> "80:100:24")
-# 3. 保留原有表格对齐和 Nano 编辑功能
+# 1. 修复：解决流量超过 2GB 后 awk 输出科学计数法导致脚本崩溃的问题
+# 2. 核心：get_bytes 函数强制转换为纯整数格式
+# 3. 继承：保留之前所有的交互式输入和 UI 美化功能
 # ==============================================================
 
 # --- 全局路径配置 ---
@@ -81,8 +81,9 @@ init_chain() {
 
 get_bytes() {
     local port=$1
-    local v_in=$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_IN_$port" '$3 == t {sum+=$2} END {print sum+0}')
-    local v_out=$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_OUT_$port" '$3 == t {sum+=$2} END {print sum+0}')
+    # 修复核心：使用 printf "%.0f" 强制 awk 输出完整整数，禁止科学计数法 (如 2.3e+09)
+    local v_in=$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_IN_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
+    local v_out=$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_OUT_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
     echo $((${v_in:-0} + ${v_out:-0}))
 }
 
@@ -160,7 +161,7 @@ EOF
     chmod +x "$INSTALL_PATH"
 }
 
-# 3. 功能：对齐修复版仪表盘
+# 3. 功能：仪表盘 (同步应用大数修复)
 show_status() {
     if [ ! -f "$CONFIG_PATH" ]; then
         echo -e "${RED}未找到配置文件，请先安装监控！${RES}"
@@ -179,8 +180,9 @@ show_status() {
         [ -z "$line" ] && continue
         IFS=':' read -r port limit_gb block_hours <<< "$line"
 
-        v_in=$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_IN_$port" '$3 == t {sum+=$2} END {print sum+0}')
-        v_out=$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_OUT_$port" '$3 == t {sum+=$2} END {print sum+0}')
+        # 修复：同样使用 printf "%.0f" 避免 UI 显示时的计算错误
+        v_in=$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_IN_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
+        v_out=$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_OUT_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
         bytes=$((${v_in:-0} + ${v_out:-0}))
 
         if [ "$bytes" -gt 1073741824 ]; then
@@ -214,7 +216,7 @@ show_status() {
     done < "$CONFIG_PATH"
 }
 
-# 4. 安装流程 (交互式多规则版)
+# 4. 安装流程
 install_monitor() {
     check_dependencies
     
@@ -224,50 +226,33 @@ install_monitor() {
     echo "使用空格分隔，例如: 8080 500 24"
     echo "--------------------------------------------------------"
     
-    # 清空或初始化配置文件
     > "$CONFIG_PATH"
     
     while true; do
         echo -e "${BLUE}>> 请输入规则 (直接回车表示录入结束):${RES}"
         read -p "> " input_rule
-        
-        # 退出条件
-        if [ -z "$input_rule" ]; then
-            break
-        fi
-        
-        # 数据清洗：压缩连续空格，并将空格替换为冒号
-        # 例如 "80   100   24" -> "80 100 24" -> "80:100:24"
+        if [ -z "$input_rule" ]; then break; fi
         clean_rule=$(echo "$input_rule" | tr -s ' ' ':')
-        
-        # 简单校验：必须包含至少2个冒号
         if [[ $(echo "$clean_rule" | grep -o ":" | wc -l) -lt 2 ]]; then
              echo -e "${RED}格式错误！请确保输入了三个参数 (端口 流量 时间)${RES}"
              continue
         fi
-        
-        # 写入配置
         echo "$clean_rule" >> "$CONFIG_PATH"
         echo -e "${GREEN}已添加规则: $clean_rule${RES}"
     done
     
-    # 如果用户没输入任何内容，写入默认值
     if [ ! -s "$CONFIG_PATH" ]; then
         echo "80:100:24" > "$CONFIG_PATH"
         echo -e "${YELLOW}未检测到输入，已使用默认规则: 80:100:24${RES}"
     fi
     
-    echo "--------------------------------------------------------"
-    
     create_monitor_script
-    echo -e "${GREEN}核心脚本已生成。${RES}"
     
     if ! crontab -l 2>/dev/null | grep -q "$INSTALL_PATH"; then
         (crontab -l 2>/dev/null; echo "* * * * * $INSTALL_PATH >/dev/null 2>&1") | crontab -
         echo -e "${GREEN}定时任务已添加。${RES}"
     fi
     
-    # 立即初始化
     bash "$INSTALL_PATH"
     echo -e "${GREEN}安装完成！监控已启动。${RES}"
 }
@@ -297,7 +282,7 @@ uninstall_monitor() {
 while true; do
     clear
     echo -e "${BLUE}==============================================${RES}"
-    echo -e "${BOLD}    VPS 流量监控管家 (Traffic Guard v2.4)${RES}"
+    echo -e "${BOLD}    VPS 流量监控管家 (Traffic Guard v2.5)${RES}"
     echo -e "${BLUE}==============================================${RES}"
     echo " 1. 安装/重置监控 (Install - Multi Input)"
     echo " 2. 编辑监控规则 (Nano)"
@@ -313,7 +298,7 @@ while true; do
         2) 
             if [ -f "$CONFIG_PATH" ]; then
                 nano "$CONFIG_PATH"
-                echo -e "${GREEN}规则修改已保存，系统将在1分钟内自动同步。${RES}"
+                echo -e "${GREEN}修改已保存，等待更新。${RES}"
             else
                 echo -e "${RED}请先执行安装！${RES}"
             fi
