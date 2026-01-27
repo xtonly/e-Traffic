@@ -1,10 +1,10 @@
 #!/bin/bash
 # ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v2.3 Stable
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v2.4 Multi-Input
 # 更新日志：
-# 1. 修复：表格表头改为英文，完美解决中英文混合导致的对齐错乱
-# 2. 优化：支持空格分隔输入 (如 80 100 24)，无需输入冒号
-# 3. 视觉：重新调整边框样式，更加整洁
+# 1. 升级安装流程：支持连续录入多个端口规则 (循环交互模式)
+# 2. 输入容错：自动处理多余空格 (如 "80   100 24" -> "80:100:24")
+# 3. 保留原有表格对齐和 Nano 编辑功能
 # ==============================================================
 
 # --- 全局路径配置 ---
@@ -38,7 +38,7 @@ check_dependencies() {
     done
 }
 
-# 2. 生成核心监控脚本 (保持核心逻辑稳定)
+# 2. 生成核心监控脚本
 create_monitor_script() {
     cat > "$INSTALL_PATH" << 'EOF'
 #!/bin/bash
@@ -81,7 +81,6 @@ init_chain() {
 
 get_bytes() {
     local port=$1
-    # 汇总 TCP 和 UDP 流量
     local v_in=$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_IN_$port" '$3 == t {sum+=$2} END {print sum+0}')
     local v_out=$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_OUT_$port" '$3 == t {sum+=$2} END {print sum+0}')
     echo $((${v_in:-0} + ${v_out:-0}))
@@ -128,7 +127,6 @@ if [ -f "$CONF_FILE" ]; then
     while read -r line; do
         [[ "$line" =~ ^#.*$ ]] && continue
         [ -z "$line" ] && continue
-        # 兼容处理：确保读取时只处理冒号分隔
         IFS=':' read -r port limit_gb block_hours <<< "$line"
         
         init_chain "$port"
@@ -171,10 +169,7 @@ show_status() {
 
     echo -e "${BOLD}正在获取实时数据...${RES}"
     
-    # 定义分隔线 (使用 ASCII 字符以保证对齐)
     SEP="+----------+----------------+----------------+----------+------------+"
-    
-    # 打印表头 (改用英文以解决宽度不一致问题)
     echo "$SEP"
     printf "| %-8s | %-14s | %-14s | %-8s | %-10s |\n" " PORT" " USED" " LIMIT" " USAGE" " STATUS"
     echo "$SEP"
@@ -184,12 +179,10 @@ show_status() {
         [ -z "$line" ] && continue
         IFS=':' read -r port limit_gb block_hours <<< "$line"
 
-        # 获取数据
         v_in=$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_IN_$port" '$3 == t {sum+=$2} END {print sum+0}')
         v_out=$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_OUT_$port" '$3 == t {sum+=$2} END {print sum+0}')
         bytes=$((${v_in:-0} + ${v_out:-0}))
 
-        # 单位换算
         if [ "$bytes" -gt 1073741824 ]; then
             used_human=$(echo "scale=2; $bytes/1024/1024/1024" | bc)
             used_unit="GB"
@@ -198,7 +191,6 @@ show_status() {
             used_unit="MB"
         fi
 
-        # 百分比
         limit_bytes=$(echo "$limit_gb * 1024 * 1024 * 1024" | bc | cut -d. -f1)
         if [ "$limit_bytes" -gt 0 ]; then
             percent=$(echo "scale=1; ($bytes * 100) / $limit_bytes" | bc)
@@ -206,7 +198,6 @@ show_status() {
             percent="0"
         fi
 
-        # 状态判定
         if [ -f "$LOCK_DIR/$port.lock" ]; then
             status_txt="BLOCKED"
             color_code="${RED}"
@@ -215,7 +206,6 @@ show_status() {
             color_code="${GREEN}"
         fi
         
-        # 打印行：全英文数据保证 100% 对齐
         printf "| %-8s | %-14s | %-14s | %-8s | %b%-10s%b |\n" \
             " $port" " $used_human $used_unit" " ${limit_gb} GB" " $percent%" "$color_code" " $status_txt" "${RES}"
             
@@ -224,27 +214,50 @@ show_status() {
     done < "$CONFIG_PATH"
 }
 
-# 4. 安装流程 (支持空格输入)
+# 4. 安装流程 (交互式多规则版)
 install_monitor() {
     check_dependencies
-    echo "-------------------------------------"
-    echo -e "${YELLOW}请配置监控规则${RES}"
-    echo "输入格式: 端口 流量上限(GB) 封锁时长(小时)"
-    echo "说明: 可以用空格隔开，更加方便！"
-    echo -e "示例: ${BOLD}8080 500 24${RES}"
-    echo "-------------------------------------"
-    read -p "请输入规则: " input_rule
     
-    # 处理逻辑：如果用户输入为空，使用默认值
-    if [ -z "$input_rule" ]; then
-        user_rule="80:100:24"
-    else
-        # 核心修改：将所有空格替换为冒号
-        user_rule="${input_rule// /:}"
+    echo "--------------------------------------------------------"
+    echo -e "${YELLOW}开始配置监控规则 (支持多端口录入)${RES}"
+    echo "输入格式: 端口 流量上限(GB) 封锁时长(小时)"
+    echo "使用空格分隔，例如: 8080 500 24"
+    echo "--------------------------------------------------------"
+    
+    # 清空或初始化配置文件
+    > "$CONFIG_PATH"
+    
+    while true; do
+        echo -e "${BLUE}>> 请输入规则 (直接回车表示录入结束):${RES}"
+        read -p "> " input_rule
+        
+        # 退出条件
+        if [ -z "$input_rule" ]; then
+            break
+        fi
+        
+        # 数据清洗：压缩连续空格，并将空格替换为冒号
+        # 例如 "80   100   24" -> "80 100 24" -> "80:100:24"
+        clean_rule=$(echo "$input_rule" | tr -s ' ' ':')
+        
+        # 简单校验：必须包含至少2个冒号
+        if [[ $(echo "$clean_rule" | grep -o ":" | wc -l) -lt 2 ]]; then
+             echo -e "${RED}格式错误！请确保输入了三个参数 (端口 流量 时间)${RES}"
+             continue
+        fi
+        
+        # 写入配置
+        echo "$clean_rule" >> "$CONFIG_PATH"
+        echo -e "${GREEN}已添加规则: $clean_rule${RES}"
+    done
+    
+    # 如果用户没输入任何内容，写入默认值
+    if [ ! -s "$CONFIG_PATH" ]; then
+        echo "80:100:24" > "$CONFIG_PATH"
+        echo -e "${YELLOW}未检测到输入，已使用默认规则: 80:100:24${RES}"
     fi
     
-    echo "$user_rule" > "$CONFIG_PATH"
-    echo -e "${GREEN}配置已解析并保存: $user_rule${RES}"
+    echo "--------------------------------------------------------"
     
     create_monitor_script
     echo -e "${GREEN}核心脚本已生成。${RES}"
@@ -284,9 +297,9 @@ uninstall_monitor() {
 while true; do
     clear
     echo -e "${BLUE}==============================================${RES}"
-    echo -e "${BOLD}    VPS 流量监控管家 (Traffic Guard v2.3)${RES}"
+    echo -e "${BOLD}    VPS 流量监控管家 (Traffic Guard v2.4)${RES}"
     echo -e "${BLUE}==============================================${RES}"
-    echo " 1. 安装/重置监控 (Install)"
+    echo " 1. 安装/重置监控 (Install - Multi Input)"
     echo " 2. 编辑监控规则 (Nano)"
     echo -e "${YELLOW} 3. 查看实时流量状态 (Status Dashboard)${RES}"
     echo " 4. 查看操作日志 (Logs)"
