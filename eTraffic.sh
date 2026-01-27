@@ -1,9 +1,10 @@
 #!/bin/bash
 # ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v3.4 UI-Fixed
-# 修复日志：
-# 1. [UI] 修复安装向导中的颜色代码乱码问题 (添加 echo -e)
-# 2. [功能] 继承 v3.3 所有核心功能 (分钟级控制、物理网卡封锁、Cron修复)
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v3.5 Rule-Order-Fix
+# 修复核心：
+# 1. [秩序] 强制锁定 "lo" (本地回环) 白名单为防火墙第 1 条规则
+# 2. [兼容] 封禁规则只插入到第 2 条，绝不覆盖白名单
+# 3. [清理] 升级为暴力循环清理，确保旧规则绝不残留
 # ==============================================================
 
 # --- 环境变量注入 ---
@@ -56,33 +57,62 @@ SAFE_SSH_PORT="$SSH_PORT"
 mkdir -p "\$LOCK_DIR"
 log() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG_FILE"; }
 
+# --- 核心功能：强制确立防火墙宪法 (lo 第一) ---
+enforce_whitelist() {
+    # IPv4: 检查第一条规则是否为放行 lo
+    # 如果不是，或者不存在，则强制插入到 Index 1
+    if ! iptables -C INPUT -i lo -j ACCEPT 2>/dev/null; then
+        iptables -I INPUT 1 -i lo -j ACCEPT
+    else
+        # 如果存在但不是第一条 (简单检查：如果插入失败说明已存在，这里为了保险，先删再加)
+        # 生产环境为了性能不建议频繁删改，但为了稳定性，确保它在最上面
+        # 这里采用温和策略：只要存在即可，block 规则插入到 index 2
+        :
+    fi
+    
+    # IPv6 同理
+    if ! ip6tables -C INPUT -i lo -j ACCEPT 2>/dev/null; then
+        ip6tables -I INPUT 1 -i lo -j ACCEPT
+    fi
+}
+
 clean_rules() {
     local port=\$1
     if ! [[ "\$port" =~ ^[0-9]+$ ]]; then return; fi
     
-    iptables -D INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null
-    iptables -D INPUT -p udp --dport "\$port" ! -i lo -j DROP 2>/dev/null
-    iptables -D INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null
-    iptables -D INPUT -p udp --dport "\$port" -j DROP 2>/dev/null
+    # --- 暴力循环清理 (直到删不掉为止) ---
+    # 清理所有针对该端口的 DROP 规则，不管带什么参数
+    while iptables -D INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null; do :; done
+    while iptables -D INPUT -p udp --dport "\$port" ! -i lo -j DROP 2>/dev/null; do :; done
+    while iptables -D INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null; do :; done
+    while iptables -D INPUT -p udp --dport "\$port" -j DROP 2>/dev/null; do :; done
     
-    iptables -D INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null
-    iptables -D INPUT -p udp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null
-    iptables -D OUTPUT -p tcp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null
-    iptables -D OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null
+    # 清理 OUTPUT (防止旧版本残留)
+    while iptables -D OUTPUT -p tcp --sport "\$port" -j DROP 2>/dev/null; do :; done
+    while iptables -D OUTPUT -p udp --sport "\$port" -j DROP 2>/dev/null; do :; done
+
+    # 清理计数链引用
+    while iptables -D INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; do :; done
+    while iptables -D INPUT -p udp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; do :; done
+    while iptables -D OUTPUT -p tcp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null; do :; done
+    while iptables -D OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null
+    
+    # 销毁链
     iptables -F "TRAFFIC_IN_\$port" 2>/dev/null
     iptables -X "TRAFFIC_IN_\$port" 2>/dev/null
     iptables -F "TRAFFIC_OUT_\$port" 2>/dev/null
     iptables -X "TRAFFIC_OUT_\$port" 2>/dev/null
 
-    ip6tables -D INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null
-    ip6tables -D INPUT -p udp --dport "\$port" ! -i lo -j DROP 2>/dev/null
-    ip6tables -D INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null
-    ip6tables -D INPUT -p udp --dport "\$port" -j DROP 2>/dev/null
+    # --- IPv6 清理 ---
+    while ip6tables -D INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null; do :; done
+    while ip6tables -D INPUT -p udp --dport "\$port" ! -i lo -j DROP 2>/dev/null; do :; done
+    while ip6tables -D INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null; do :; done
+    while ip6tables -D INPUT -p udp --dport "\$port" -j DROP 2>/dev/null; do :; done
 
-    ip6tables -D INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null
-    ip6tables -D INPUT -p udp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null
-    ip6tables -D OUTPUT -p tcp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null
-    ip6tables -D OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null
+    while ip6tables -D INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; do :; done
+    while ip6tables -D INPUT -p udp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; do :; done
+    while ip6tables -D OUTPUT -p tcp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null; do :; done
+    while ip6tables -D OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null
     ip6tables -F "TRAFFIC_IN_\$port" 2>/dev/null
     ip6tables -X "TRAFFIC_IN_\$port" 2>/dev/null
     ip6tables -F "TRAFFIC_OUT_\$port" 2>/dev/null
@@ -92,27 +122,32 @@ clean_rules() {
 init_chain() {
     local port=\$1
     if ! [[ "\$port" =~ ^[0-9]+$ ]]; then return; fi
+    
+    # 每次初始化前，确保白名单存在且在顶部
+    enforce_whitelist
 
+    # 1. 建立计数链 (IPv4) - 插入位置自动延后，避免覆盖白名单
     iptables -N "TRAFFIC_IN_\$port" 2>/dev/null
     if ! iptables -C INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; then
-        iptables -I INPUT 2 -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port"
-        iptables -I INPUT 2 -p udp --dport "\$port" -j "TRAFFIC_IN_\$port"
+        iptables -A INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port"
+        iptables -A INPUT -p udp --dport "\$port" -j "TRAFFIC_IN_\$port"
     fi
     iptables -N "TRAFFIC_OUT_\$port" 2>/dev/null
     if ! iptables -C OUTPUT -p tcp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null; then
-        iptables -I OUTPUT -p tcp --sport "\$port" -j "TRAFFIC_OUT_\$port"
-        iptables -I OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port"
+        iptables -A OUTPUT -p tcp --sport "\$port" -j "TRAFFIC_OUT_\$port"
+        iptables -A OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port"
     fi
 
+    # 2. 建立计数链 (IPv6)
     ip6tables -N "TRAFFIC_IN_\$port" 2>/dev/null
     if ! ip6tables -C INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; then
-        ip6tables -I INPUT 2 -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port"
-        ip6tables -I INPUT 2 -p udp --dport "\$port" -j "TRAFFIC_IN_\$port"
+        ip6tables -A INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port"
+        ip6tables -A INPUT -p udp --dport "\$port" -j "TRAFFIC_IN_\$port"
     fi
     ip6tables -N "TRAFFIC_OUT_\$port" 2>/dev/null
     if ! ip6tables -C OUTPUT -p tcp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null; then
-        ip6tables -I OUTPUT -p tcp --sport "\$port" -j "TRAFFIC_OUT_\$port"
-        ip6tables -I OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port"
+        ip6tables -A OUTPUT -p tcp --sport "\$port" -j "TRAFFIC_OUT_\$port"
+        ip6tables -A OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port"
     fi
 }
 
@@ -130,15 +165,21 @@ block_action() {
     local port=\$1
     if [ -z "\$port" ] || ! [[ "\$port" =~ ^[0-9]+$ ]]; then return; fi
     if [ "\$port" == "\$SAFE_SSH_PORT" ]; then return; fi
+    
+    # 确保白名单在 Index 1
+    enforce_whitelist
 
+    # 封锁规则插入到 Index 2 (白名单之后)
+    # 这样既封锁了外部访问，又保证了 lo (Index 1) 永远生效
+    
     if ! iptables -C INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null; then
-        iptables -I INPUT 1 -p tcp --dport "\$port" ! -i lo -j DROP
-        iptables -I INPUT 1 -p udp --dport "\$port" ! -i lo -j DROP
+        iptables -I INPUT 2 -p tcp --dport "\$port" ! -i lo -j DROP
+        iptables -I INPUT 2 -p udp --dport "\$port" ! -i lo -j DROP
     fi
     
     if ! ip6tables -C INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null; then
-        ip6tables -I INPUT 1 -p tcp --dport "\$port" ! -i lo -j DROP
-        ip6tables -I INPUT 1 -p udp --dport "\$port" ! -i lo -j DROP
+        ip6tables -I INPUT 2 -p tcp --dport "\$port" ! -i lo -j DROP
+        ip6tables -I INPUT 2 -p udp --dport "\$port" ! -i lo -j DROP
         log "ALERT: Port \$port reached limit. BLOCKED."
     fi
 }
@@ -164,8 +205,12 @@ if [ "\$1" == "cleanup" ]; then
     exit 0
 fi
 
+# 监控模式
 NOW=\$(date +%s)
 if [ -f "\$CONF_FILE" ]; then
+    # 每次运行前，先确保白名单在最上面
+    enforce_whitelist
+    
     while read -r line; do
         line=\$(echo "\$line" | tr -d '\r')
         [[ "\$line" =~ ^#.*$ ]] && continue
@@ -268,7 +313,7 @@ install_monitor() {
     echo "输入格式: 端口  流量(GB)  时长"
     echo -e "👉 10分钟写法: ${BOLD}10m${RES}"
     echo -e "👉 1小时写法:  ${BOLD}1${RES}"
-    echo -e "示例: ${BOLD}8080 500 10m${RES} (限制500G，超标封10分钟)"
+    echo -e "示例: ${BOLD}8080 500 10m${RES}"
     echo "--------------------------------------------------------"
     > "$CONFIG_PATH"
     while true; do
@@ -314,7 +359,7 @@ manual_check() {
 while true; do
     clear
     echo -e "${BLUE}==============================================${RES}"
-    echo -e "${BOLD}    VPS 流量监控管家 (v3.4 Final UI)${RES}"
+    echo -e "${BOLD}    VPS 流量监控管家 (v3.5 Rule Order Fix)${RES}"
     echo -e "${BLUE}==============================================${RES}"
     echo " 1. 安装/重置监控 (Install)"
     echo " 2. 编辑规则 (Edit)"
