@@ -1,16 +1,16 @@
 #!/bin/bash
 # ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v3.2 Ingress-Only
-# 核心修复：
-# 1. [关键] 移除所有 OUTPUT 封锁规则：彻底解决“封端口导致代理无法对外连接”的问题
-# 2. [稳健] 使用 `! -i lo` 替代物理网卡名：精准拦截外部流量，绝对放行本地回环
-# 3. [霸道] 规则强制插入 INPUT 链首：确保优先级高于 Shoes/Xray 自带规则
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v3.3 Flex-Time
+# 更新日志：
+# 1. [时间] 支持分钟级封锁！输入 "10m" 代表10分钟，输入 "1" 代表1小时
+# 2. [计算] 引入 bc 处理时间计算，支持 "0.5" 小时这种小数输入
+# 3. [继承] 保留 v3.2 的所有安全特性 (只封入口、物理网卡识别、回环白名单)
 # ==============================================================
 
-# --- 环境变量注入 (修复 Cron 问题) ---
+# --- 环境变量注入 ---
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# --- 全局路径配置 ---
+# --- 全局配置 ---
 INSTALL_PATH="/usr/local/bin/traffic_guard.sh"
 CONFIG_PATH="/etc/traffic_guard.conf"
 LOG_FILE="/var/log/traffic_guard.log"
@@ -57,22 +57,16 @@ SAFE_SSH_PORT="$SSH_PORT"
 mkdir -p "\$LOCK_DIR"
 log() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG_FILE"; }
 
-# 清理函数
 clean_rules() {
     local port=\$1
     if ! [[ "\$port" =~ ^[0-9]+$ ]]; then return; fi
     
-    # 清理 IPv4 INPUT (旧版 + 新版)
+    # 清理 IPv4 INPUT
     iptables -D INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null
     iptables -D INPUT -p udp --dport "\$port" ! -i lo -j DROP 2>/dev/null
+    # 兼容清理旧规则
     iptables -D INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null
     iptables -D INPUT -p udp --dport "\$port" -j DROP 2>/dev/null
-    
-    # !!! 关键：清理所有可能残留的 OUTPUT 规则 !!!
-    iptables -D OUTPUT -p tcp --sport "\$port" -j DROP 2>/dev/null
-    iptables -D OUTPUT -p udp --sport "\$port" -j DROP 2>/dev/null
-    iptables -D OUTPUT -p tcp --sport "\$port" ! -d 127.0.0.1 -j DROP 2>/dev/null
-    iptables -D OUTPUT -p udp --sport "\$port" ! -d 127.0.0.1 -j DROP 2>/dev/null
     
     # 清理计数链
     iptables -D INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null
@@ -87,10 +81,9 @@ clean_rules() {
     # 清理 IPv6
     ip6tables -D INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null
     ip6tables -D INPUT -p udp --dport "\$port" ! -i lo -j DROP 2>/dev/null
+    # 兼容清理
     ip6tables -D INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null
     ip6tables -D INPUT -p udp --dport "\$port" -j DROP 2>/dev/null
-    ip6tables -D OUTPUT -p tcp --sport "\$port" -j DROP 2>/dev/null
-    ip6tables -D OUTPUT -p udp --sport "\$port" -j DROP 2>/dev/null
 
     ip6tables -D INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null
     ip6tables -D INPUT -p udp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null
@@ -106,7 +99,7 @@ init_chain() {
     local port=\$1
     if ! [[ "\$port" =~ ^[0-9]+$ ]]; then return; fi
 
-    # 1. 建立计数链 (IPv4) - 插入到 INPUT/OUTPUT 链头，确保能统计到
+    # 1. 建立 IPv4 计数链
     iptables -N "TRAFFIC_IN_\$port" 2>/dev/null
     if ! iptables -C INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; then
         iptables -I INPUT 2 -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port"
@@ -118,7 +111,7 @@ init_chain() {
         iptables -I OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port"
     fi
 
-    # 2. 建立计数链 (IPv6)
+    # 2. 建立 IPv6 计数链
     ip6tables -N "TRAFFIC_IN_\$port" 2>/dev/null
     if ! ip6tables -C INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; then
         ip6tables -I INPUT 2 -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port"
@@ -146,21 +139,17 @@ block_action() {
     if [ -z "\$port" ] || ! [[ "\$port" =~ ^[0-9]+$ ]]; then return; fi
     if [ "\$port" == "\$SAFE_SSH_PORT" ]; then return; fi
 
-    # --- 核心修改：只封锁 INPUT，且使用 ! -i lo (非回环) ---
-    # 彻底移除 OUTPUT 封锁，解决代理无法对外连接的问题
-    
-    # IPv4 封锁
+    # IPv4 封锁 (只封入口，放行 lo)
     if ! iptables -C INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null; then
-        # 强制插入第一行 (Index 1)，确保比 Shoes 的规则优先
         iptables -I INPUT 1 -p tcp --dport "\$port" ! -i lo -j DROP
         iptables -I INPUT 1 -p udp --dport "\$port" ! -i lo -j DROP
     fi
     
-    # IPv6 封锁
+    # IPv6 封锁 (只封入口，放行 lo)
     if ! ip6tables -C INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null; then
         ip6tables -I INPUT 1 -p tcp --dport "\$port" ! -i lo -j DROP
         ip6tables -I INPUT 1 -p udp --dport "\$port" ! -i lo -j DROP
-        log "ALERT: Port \$port reached limit. BLOCKED (Ingress Only)."
+        log "ALERT: Port \$port reached limit. BLOCKED."
     fi
 }
 
@@ -171,7 +160,6 @@ unblock_action() {
     log "INFO: Port \$port expired. UNBLOCKED."
 }
 
-# 清理模式
 if [ "\$1" == "cleanup" ]; then
     if [ -f "\$CONF_FILE" ]; then
         while read -r line; do
@@ -193,18 +181,31 @@ if [ -f "\$CONF_FILE" ]; then
         line=\$(echo "\$line" | tr -d '\r')
         [[ "\$line" =~ ^#.*$ ]] && continue
         [ -z "\$line" ] && continue
-        IFS=':' read -r port limit_gb block_hours <<< "\$line"
+        # 解析配置：端口 流量 时间(可能带m)
+        IFS=':' read -r port limit_gb raw_time <<< "\$line"
         
         if ! [[ "\$port" =~ ^[0-9]+$ ]]; then continue; fi
 
         init_chain "\$port"
         lock_file="\$LOCK_DIR/\$port.lock"
         
+        # --- 智能时间计算 (核心升级) ---
+        # 如果包含 'm'，则按分钟计算；否则按小时计算
+        if [[ "\$raw_time" == *"m"* ]]; then
+            # 去掉 'm'，乘以 60 秒
+            time_val=\${raw_time%m}
+            unlock_sec=\$(echo "\$time_val * 60" | bc | cut -d. -f1)
+        else
+            # 默认小时，乘以 3600 秒
+            unlock_sec=\$(echo "\$raw_time * 3600" | bc | cut -d. -f1)
+        fi
+        # ---------------------------
+        
         if [ -f "\$lock_file" ]; then
             block_time=\$(cat "\$lock_file")
             [ -z "\$block_time" ] && block_time=\$NOW && echo \$NOW > "\$lock_file"
             elapsed=\$((\$NOW - \$block_time))
-            unlock_sec=\$((\$block_hours * 3600))
+            
             if [ "\$elapsed" -ge "\$unlock_sec" ]; then
                 unblock_action "\$port"
                 rm -f "\$lock_file"
@@ -221,7 +222,7 @@ if [ -f "\$CONF_FILE" ]; then
         if [ "\$total_bytes" -ge "\$limit_bytes" ]; then
             echo "\$NOW" > "\$lock_file"
             block_action "\$port"
-            log "Port \$port reached limit (\${limit_gb}GB). Blocking."
+            log "Port \$port reached limit (\${limit_gb}GB). Blocking for \$raw_time."
         fi
     done < "\$CONF_FILE"
 fi
@@ -242,7 +243,7 @@ show_status() {
         line=$(echo "$line" | tr -d '\r')
         [[ "$line" =~ ^#.*$ ]] && continue
         [ -z "$line" ] && continue
-        IFS=':' read -r port limit_gb block_hours <<< "$line"
+        IFS=':' read -r port limit_gb raw_time <<< "$line"
         if ! [[ "$port" =~ ^[0-9]+$ ]]; then continue; fi
 
         v4_in=$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_IN_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
@@ -280,8 +281,11 @@ show_status() {
 install_monitor() {
     check_dependencies
     echo "--------------------------------------------------------"
-    echo -e "${YELLOW}配置监控规则${RES}"
-    echo "格式: 端口 流量(GB) 时间(小时)   示例: 8080 500 24"
+    echo -e "${YELLOW}配置监控规则 (支持分钟级设定)${RES}"
+    echo "输入格式: 端口  流量(GB)  时长"
+    echo "👉 10分钟写法: ${BOLD}10m${RES}"
+    echo "👉 1小时写法:  ${BOLD}1${RES}"
+    echo "示例: ${BOLD}8080 500 10m${RES} (限制500G，超标封10分钟)"
     echo "--------------------------------------------------------"
     > "$CONFIG_PATH"
     while true; do
@@ -300,7 +304,7 @@ install_monitor() {
     fi
     systemctl restart crond >/dev/null 2>&1
     bash "$INSTALL_PATH"
-    echo -e "${GREEN}安装完成！已优化 INPUT 封锁策略。${RES}"
+    echo -e "${GREEN}安装完成！已启用智能时间识别。${RES}"
 }
 
 force_reset() {
@@ -327,7 +331,7 @@ manual_check() {
 while true; do
     clear
     echo -e "${BLUE}==============================================${RES}"
-    echo -e "${BOLD}    VPS 流量监控管家 (v3.2 Ingress Only)${RES}"
+    echo -e "${BOLD}    VPS 流量监控管家 (v3.3 Flex-Time)${RES}"
     echo -e "${BLUE}==============================================${RES}"
     echo " 1. 安装/重置监控 (Install)"
     echo " 2. 编辑规则 (Edit)"
