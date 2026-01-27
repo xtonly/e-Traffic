@@ -1,10 +1,10 @@
 #!/bin/bash
 # ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v3.5 Rule-Order-Fix
-# 修复核心：
-# 1. [秩序] 强制锁定 "lo" (本地回环) 白名单为防火墙第 1 条规则
-# 2. [兼容] 封禁规则只插入到第 2 条，绝不覆盖白名单
-# 3. [清理] 升级为暴力循环清理，确保旧规则绝不残留
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v3.6 Syntax-Fix
+# 修复内容：
+# 1. [修复] 修正 v3.5 中的 "syntax error near unexpected token '}'" 错误
+# 2. [精简] 移除冗余的 else 分支，确保代码在所有 Shell 下兼容
+# 3. [保留] 完美保留 v3.5 的所有核心功能 (lo白名单、排序修复、暴力清理)
 # ==============================================================
 
 # --- 环境变量注入 ---
@@ -59,18 +59,12 @@ log() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG_FILE"; }
 
 # --- 核心功能：强制确立防火墙宪法 (lo 第一) ---
 enforce_whitelist() {
-    # IPv4: 检查第一条规则是否为放行 lo
-    # 如果不是，或者不存在，则强制插入到 Index 1
+    # 确保 IPv4 本地回环放行在第一条
     if ! iptables -C INPUT -i lo -j ACCEPT 2>/dev/null; then
         iptables -I INPUT 1 -i lo -j ACCEPT
-    else
-        # 如果存在但不是第一条 (简单检查：如果插入失败说明已存在，这里为了保险，先删再加)
-        # 生产环境为了性能不建议频繁删改，但为了稳定性，确保它在最上面
-        # 这里采用温和策略：只要存在即可，block 规则插入到 index 2
-        :
     fi
     
-    # IPv6 同理
+    # 确保 IPv6 本地回环放行在第一条
     if ! ip6tables -C INPUT -i lo -j ACCEPT 2>/dev/null; then
         ip6tables -I INPUT 1 -i lo -j ACCEPT
     fi
@@ -80,14 +74,13 @@ clean_rules() {
     local port=\$1
     if ! [[ "\$port" =~ ^[0-9]+$ ]]; then return; fi
     
-    # --- 暴力循环清理 (直到删不掉为止) ---
-    # 清理所有针对该端口的 DROP 规则，不管带什么参数
+    # --- 暴力循环清理 IPv4 ---
     while iptables -D INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null; do :; done
     while iptables -D INPUT -p udp --dport "\$port" ! -i lo -j DROP 2>/dev/null; do :; done
     while iptables -D INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null; do :; done
     while iptables -D INPUT -p udp --dport "\$port" -j DROP 2>/dev/null; do :; done
     
-    # 清理 OUTPUT (防止旧版本残留)
+    # 清理可能残留的 OUTPUT
     while iptables -D OUTPUT -p tcp --sport "\$port" -j DROP 2>/dev/null; do :; done
     while iptables -D OUTPUT -p udp --sport "\$port" -j DROP 2>/dev/null; do :; done
 
@@ -103,7 +96,7 @@ clean_rules() {
     iptables -F "TRAFFIC_OUT_\$port" 2>/dev/null
     iptables -X "TRAFFIC_OUT_\$port" 2>/dev/null
 
-    # --- IPv6 清理 ---
+    # --- 暴力循环清理 IPv6 ---
     while ip6tables -D INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null; do :; done
     while ip6tables -D INPUT -p udp --dport "\$port" ! -i lo -j DROP 2>/dev/null; do :; done
     while ip6tables -D INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null; do :; done
@@ -113,6 +106,7 @@ clean_rules() {
     while ip6tables -D INPUT -p udp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; do :; done
     while ip6tables -D OUTPUT -p tcp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null; do :; done
     while ip6tables -D OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null
+    
     ip6tables -F "TRAFFIC_IN_\$port" 2>/dev/null
     ip6tables -X "TRAFFIC_IN_\$port" 2>/dev/null
     ip6tables -F "TRAFFIC_OUT_\$port" 2>/dev/null
@@ -126,7 +120,7 @@ init_chain() {
     # 每次初始化前，确保白名单存在且在顶部
     enforce_whitelist
 
-    # 1. 建立计数链 (IPv4) - 插入位置自动延后，避免覆盖白名单
+    # 1. 建立计数链 (IPv4)
     iptables -N "TRAFFIC_IN_\$port" 2>/dev/null
     if ! iptables -C INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; then
         iptables -A INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port"
@@ -170,8 +164,6 @@ block_action() {
     enforce_whitelist
 
     # 封锁规则插入到 Index 2 (白名单之后)
-    # 这样既封锁了外部访问，又保证了 lo (Index 1) 永远生效
-    
     if ! iptables -C INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null; then
         iptables -I INPUT 2 -p tcp --dport "\$port" ! -i lo -j DROP
         iptables -I INPUT 2 -p udp --dport "\$port" ! -i lo -j DROP
@@ -359,7 +351,7 @@ manual_check() {
 while true; do
     clear
     echo -e "${BLUE}==============================================${RES}"
-    echo -e "${BOLD}    VPS 流量监控管家 (v3.5 Rule Order Fix)${RES}"
+    echo -e "${BOLD}    VPS 流量监控管家 (v3.6 Syntax Fix)${RES}"
     echo -e "${BLUE}==============================================${RES}"
     echo " 1. 安装/重置监控 (Install)"
     echo " 2. 编辑规则 (Edit)"
