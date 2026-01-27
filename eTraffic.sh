@@ -1,10 +1,10 @@
 #!/bin/bash
 # ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v3.1 NIC-Based
-# 针对 Shoes/Reality/Xray 架构的完美修复：
-# 1. [核心] 基于物理网卡 (Interface) 封锁，彻底放行 lo 回环接口
-# 2. [兼容] 解决 TCP Ping 通但服务挂掉的“半死”状态
-# 3. [守护] 强制 Cron 环境变量，确保自动封禁生效
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v3.2 Ingress-Only
+# 核心修复：
+# 1. [关键] 移除所有 OUTPUT 封锁规则：彻底解决“封端口导致代理无法对外连接”的问题
+# 2. [稳健] 使用 `! -i lo` 替代物理网卡名：精准拦截外部流量，绝对放行本地回环
+# 3. [霸道] 规则强制插入 INPUT 链首：确保优先级高于 Shoes/Xray 自带规则
 # ==============================================================
 
 # --- 环境变量注入 (修复 Cron 问题) ---
@@ -37,46 +37,42 @@ check_dependencies() {
             $CMD $pkg >/dev/null 2>&1
         fi
     done
-    # 确保 Cron 服务运行
     systemctl enable crond >/dev/null 2>&1
     systemctl start crond >/dev/null 2>&1
 }
 
-# 2. 生成核心监控脚本
 create_monitor_script() {
-    # 自动获取 SSH 端口
     SSH_PORT=$(netstat -tnlp 2>/dev/null | grep sshd | awk '{print $4}' | awk -F: '{print $NF}' | head -n 1)
     [ -z "$SSH_PORT" ] && SSH_PORT=22
     
-    # 自动获取公网物理网卡名称 (例如 eth0, ens3)
-    WAN_IF=$(ip route | grep default | awk '{print $5}' | head -n 1)
-    if [ -z "$WAN_IF" ]; then WAN_IF="eth0"; fi
-
     cat > "$INSTALL_PATH" << EOF
 #!/bin/bash
-# 注入环境变量，确保 Cron 能跑
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 CONF_FILE="/etc/traffic_guard.conf"
 LOG_FILE="/var/log/traffic_guard.log"
 LOCK_DIR="/tmp/traffic_guard_locks"
 SAFE_SSH_PORT="$SSH_PORT"
-WAN_INTERFACE="$WAN_IF"
 
 mkdir -p "\$LOCK_DIR"
 log() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG_FILE"; }
 
-# 清理规则
+# 清理函数
 clean_rules() {
     local port=\$1
     if ! [[ "\$port" =~ ^[0-9]+$ ]]; then return; fi
     
-    # 清理物理接口封锁规则 (IPv4)
-    iptables -D INPUT -i \$WAN_INTERFACE -p tcp --dport "\$port" -j DROP 2>/dev/null
-    iptables -D INPUT -i \$WAN_INTERFACE -p udp --dport "\$port" -j DROP 2>/dev/null
-    # 兼容清理旧规则
+    # 清理 IPv4 INPUT (旧版 + 新版)
+    iptables -D INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null
+    iptables -D INPUT -p udp --dport "\$port" ! -i lo -j DROP 2>/dev/null
     iptables -D INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null
     iptables -D INPUT -p udp --dport "\$port" -j DROP 2>/dev/null
+    
+    # !!! 关键：清理所有可能残留的 OUTPUT 规则 !!!
+    iptables -D OUTPUT -p tcp --sport "\$port" -j DROP 2>/dev/null
+    iptables -D OUTPUT -p udp --sport "\$port" -j DROP 2>/dev/null
+    iptables -D OUTPUT -p tcp --sport "\$port" ! -d 127.0.0.1 -j DROP 2>/dev/null
+    iptables -D OUTPUT -p udp --sport "\$port" ! -d 127.0.0.1 -j DROP 2>/dev/null
     
     # 清理计数链
     iptables -D INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null
@@ -89,11 +85,12 @@ clean_rules() {
     iptables -X "TRAFFIC_OUT_\$port" 2>/dev/null
 
     # 清理 IPv6
-    ip6tables -D INPUT -i \$WAN_INTERFACE -p tcp --dport "\$port" -j DROP 2>/dev/null
-    ip6tables -D INPUT -i \$WAN_INTERFACE -p udp --dport "\$port" -j DROP 2>/dev/null
-    # 兼容清理
+    ip6tables -D INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null
+    ip6tables -D INPUT -p udp --dport "\$port" ! -i lo -j DROP 2>/dev/null
     ip6tables -D INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null
     ip6tables -D INPUT -p udp --dport "\$port" -j DROP 2>/dev/null
+    ip6tables -D OUTPUT -p tcp --sport "\$port" -j DROP 2>/dev/null
+    ip6tables -D OUTPUT -p udp --sport "\$port" -j DROP 2>/dev/null
 
     ip6tables -D INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null
     ip6tables -D INPUT -p udp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null
@@ -109,15 +106,7 @@ init_chain() {
     local port=\$1
     if ! [[ "\$port" =~ ^[0-9]+$ ]]; then return; fi
 
-    # 1. 强制放行回环接口 lo (解决 Reality 内部转发失败的问题)
-    if ! iptables -C INPUT -i lo -j ACCEPT 2>/dev/null; then
-        iptables -I INPUT 1 -i lo -j ACCEPT
-    fi
-    if ! ip6tables -C INPUT -i lo -j ACCEPT 2>/dev/null; then
-        ip6tables -I INPUT 1 -i lo -j ACCEPT
-    fi
-
-    # 2. 建立计数链 (IPv4)
+    # 1. 建立计数链 (IPv4) - 插入到 INPUT/OUTPUT 链头，确保能统计到
     iptables -N "TRAFFIC_IN_\$port" 2>/dev/null
     if ! iptables -C INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; then
         iptables -I INPUT 2 -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port"
@@ -129,7 +118,7 @@ init_chain() {
         iptables -I OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port"
     fi
 
-    # 3. 建立计数链 (IPv6)
+    # 2. 建立计数链 (IPv6)
     ip6tables -N "TRAFFIC_IN_\$port" 2>/dev/null
     if ! ip6tables -C INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; then
         ip6tables -I INPUT 2 -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port"
@@ -157,21 +146,21 @@ block_action() {
     if [ -z "\$port" ] || ! [[ "\$port" =~ ^[0-9]+$ ]]; then return; fi
     if [ "\$port" == "\$SAFE_SSH_PORT" ]; then return; fi
 
-    # 核心修复：只封锁来自 WAN 接口 (物理网卡) 的流量
-    # 这样内部 lo 接口完全不受影响，Reality 不会死锁
+    # --- 核心修改：只封锁 INPUT，且使用 ! -i lo (非回环) ---
+    # 彻底移除 OUTPUT 封锁，解决代理无法对外连接的问题
     
     # IPv4 封锁
-    if ! iptables -C INPUT -i \$WAN_INTERFACE -p tcp --dport "\$port" -j DROP 2>/dev/null; then
-        # 插入到第一行，确保优先级最高
-        iptables -I INPUT 1 -i \$WAN_INTERFACE -p tcp --dport "\$port" -j DROP
-        iptables -I INPUT 1 -i \$WAN_INTERFACE -p udp --dport "\$port" -j DROP
+    if ! iptables -C INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null; then
+        # 强制插入第一行 (Index 1)，确保比 Shoes 的规则优先
+        iptables -I INPUT 1 -p tcp --dport "\$port" ! -i lo -j DROP
+        iptables -I INPUT 1 -p udp --dport "\$port" ! -i lo -j DROP
     fi
     
     # IPv6 封锁
-    if ! ip6tables -C INPUT -i \$WAN_INTERFACE -p tcp --dport "\$port" -j DROP 2>/dev/null; then
-        ip6tables -I INPUT 1 -i \$WAN_INTERFACE -p tcp --dport "\$port" -j DROP
-        ip6tables -I INPUT 1 -i \$WAN_INTERFACE -p udp --dport "\$port" -j DROP
-        log "ALERT: Port \$port reached limit. BLOCKED on interface \$WAN_INTERFACE."
+    if ! ip6tables -C INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null; then
+        ip6tables -I INPUT 1 -p tcp --dport "\$port" ! -i lo -j DROP
+        ip6tables -I INPUT 1 -p udp --dport "\$port" ! -i lo -j DROP
+        log "ALERT: Port \$port reached limit. BLOCKED (Ingress Only)."
     fi
 }
 
@@ -227,7 +216,6 @@ if [ -f "\$CONF_FILE" ]; then
         
         total_bytes=\$(get_bytes "\$port")
         if ! command -v bc &> /dev/null; then log "Error: bc not found"; continue; fi
-        
         limit_bytes=\$(echo "\$limit_gb * 1024 * 1024 * 1024" | bc | cut -d. -f1)
         
         if [ "\$total_bytes" -ge "\$limit_bytes" ]; then
@@ -244,7 +232,7 @@ EOF
 # 3. 仪表盘
 show_status() {
     if [ ! -f "$CONFIG_PATH" ]; then echo -e "${RED}请先安装！${RES}"; return; fi
-    echo -e "${BOLD}正在获取数据 (Interface: $WAN_IF)...${RES}"
+    echo -e "${BOLD}正在获取数据 (IPv4 + IPv6)...${RES}"
     SEP="+----------+----------------+----------------+----------+------------+"
     echo "$SEP"
     printf "| %-8s | %-14s | %-14s | %-8s | %-10s |\n" " PORT" " USED" " LIMIT" " USAGE" " STATUS"
@@ -292,7 +280,7 @@ show_status() {
 install_monitor() {
     check_dependencies
     echo "--------------------------------------------------------"
-    echo -e "${YELLOW}配置监控规则 (当前网卡: $WAN_IF)${RES}"
+    echo -e "${YELLOW}配置监控规则${RES}"
     echo "格式: 端口 流量(GB) 时间(小时)   示例: 8080 500 24"
     echo "--------------------------------------------------------"
     > "$CONFIG_PATH"
@@ -310,10 +298,9 @@ install_monitor() {
     if ! crontab -l 2>/dev/null | grep -q "$INSTALL_PATH"; then
         (crontab -l 2>/dev/null; echo "* * * * * $INSTALL_PATH >/dev/null 2>&1") | crontab -
     fi
-    # 强制重启 cron 服务以确保环境生效
     systemctl restart crond >/dev/null 2>&1
     bash "$INSTALL_PATH"
-    echo -e "${GREEN}安装完成！已启用物理网卡级封锁策略。${RES}"
+    echo -e "${GREEN}安装完成！已优化 INPUT 封锁策略。${RES}"
 }
 
 force_reset() {
@@ -340,7 +327,7 @@ manual_check() {
 while true; do
     clear
     echo -e "${BLUE}==============================================${RES}"
-    echo -e "${BOLD}    VPS 流量监控管家 (v3.1 Final Fix)${RES}"
+    echo -e "${BOLD}    VPS 流量监控管家 (v3.2 Ingress Only)${RES}"
     echo -e "${BLUE}==============================================${RES}"
     echo " 1. 安装/重置监控 (Install)"
     echo " 2. 编辑规则 (Edit)"
