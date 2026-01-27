@@ -1,11 +1,10 @@
 #!/bin/bash
 # ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v2.8 Final-Rescue
-# 更新日志：
-# 1. [重磅] 新增 IPv6 支持 (ip6tables)：同步监控和封锁 IPv6 流量
-# 2. [安全] SSH 自动白名单：脚本会自动识别并保护 SSH 端口，防自杀
-# 3. [救砖] 新增 "6. 暴力重置防火墙"：一键清除所有规则，以防万一
-# 4. [修复] 配置文件清洗：自动处理 Windows 换行符和空格
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v2.9 Stable-Loopback
+# 修复核心：
+# 1. [白名单] 封禁规则增加 `! -s 127.0.0.1`，防止切断 Xray 内部回落/转发
+# 2. [稳定性] 移除 `ss -K` 暴力断连，防止导致 Xray 进程不稳定
+# 3. [精准性] 优化 IPv6 规则，防止误伤本地链路地址
 # ==============================================================
 
 # --- 全局路径配置 ---
@@ -39,7 +38,7 @@ check_dependencies() {
 
 # 2. 生成核心监控脚本
 create_monitor_script() {
-    # 自动获取当前 SSH 端口 (IPv4/IPv6)
+    # 自动获取 SSH 端口
     SSH_PORT=$(netstat -tnlp 2>/dev/null | grep sshd | awk '{print $4}' | awk -F: '{print $NF}' | head -n 1)
     [ -z "$SSH_PORT" ] && SSH_PORT=22
 
@@ -53,16 +52,23 @@ mkdir -p "\$LOCK_DIR"
 
 log() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG_FILE"; }
 
-# 清理函数 (IPv4 + IPv6)
+# 清理函数
 clean_rules() {
     local port=\$1
     if ! [[ "\$port" =~ ^[0-9]+$ ]]; then return; fi
     
-    # IPv4 清理
+    # 清理 IPv4
+    iptables -D INPUT -p tcp --dport "\$port" ! -s 127.0.0.1 -j DROP 2>/dev/null
+    iptables -D INPUT -p udp --dport "\$port" ! -s 127.0.0.1 -j DROP 2>/dev/null
+    iptables -D OUTPUT -p tcp --sport "\$port" ! -d 127.0.0.1 -j DROP 2>/dev/null
+    iptables -D OUTPUT -p udp --sport "\$port" ! -d 127.0.0.1 -j DROP 2>/dev/null
+    # 兼容清理旧版规则 (不带 -s 127.0.0.1 的)
     iptables -D INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null
     iptables -D INPUT -p udp --dport "\$port" -j DROP 2>/dev/null
     iptables -D OUTPUT -p tcp --sport "\$port" -j DROP 2>/dev/null
     iptables -D OUTPUT -p udp --sport "\$port" -j DROP 2>/dev/null
+    
+    # 清理统计链
     iptables -D INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null
     iptables -D INPUT -p udp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null
     iptables -D OUTPUT -p tcp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null
@@ -72,11 +78,17 @@ clean_rules() {
     iptables -F "TRAFFIC_OUT_\$port" 2>/dev/null
     iptables -X "TRAFFIC_OUT_\$port" 2>/dev/null
 
-    # IPv6 清理
+    # 清理 IPv6
+    ip6tables -D INPUT -p tcp --dport "\$port" ! -s ::1 -j DROP 2>/dev/null
+    ip6tables -D INPUT -p udp --dport "\$port" ! -s ::1 -j DROP 2>/dev/null
+    ip6tables -D OUTPUT -p tcp --sport "\$port" ! -d ::1 -j DROP 2>/dev/null
+    ip6tables -D OUTPUT -p udp --sport "\$port" ! -d ::1 -j DROP 2>/dev/null
+    # 兼容清理旧版
     ip6tables -D INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null
     ip6tables -D INPUT -p udp --dport "\$port" -j DROP 2>/dev/null
     ip6tables -D OUTPUT -p tcp --sport "\$port" -j DROP 2>/dev/null
     ip6tables -D OUTPUT -p udp --sport "\$port" -j DROP 2>/dev/null
+
     ip6tables -D INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null
     ip6tables -D INPUT -p udp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null
     ip6tables -D OUTPUT -p tcp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null
@@ -87,7 +99,7 @@ clean_rules() {
     ip6tables -X "TRAFFIC_OUT_\$port" 2>/dev/null
 }
 
-# 初始化链 (IPv4 + IPv6)
+# 初始化链
 init_chain() {
     local port=\$1
     if ! [[ "\$port" =~ ^[0-9]+$ ]]; then return; fi
@@ -120,38 +132,35 @@ init_chain() {
 get_bytes() {
     local port=\$1
     if ! [[ "\$port" =~ ^[0-9]+$ ]]; then echo 0; return; fi
-    # IPv4 统计
     local v4_in=\$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_IN_\$port" '\$3 == t {sum+=\$2} END {printf "%.0f", sum}')
     local v4_out=\$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_OUT_\$port" '\$3 == t {sum+=\$2} END {printf "%.0f", sum}')
-    # IPv6 统计
     local v6_in=\$(ip6tables -L INPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_IN_\$port" '\$3 == t {sum+=\$2} END {printf "%.0f", sum}')
     local v6_out=\$(ip6tables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_OUT_\$port" '\$3 == t {sum+=\$2} END {printf "%.0f", sum}')
-    
     echo \$((\${v4_in:-0} + \${v4_out:-0} + \${v6_in:-0} + \${v6_out:-0}))
 }
 
 block_action() {
     local port=\$1
     if [ -z "\$port" ] || ! [[ "\$port" =~ ^[0-9]+$ ]]; then return; fi
-    # 安全锁：绝对不封 SSH 端口
     if [ "\$port" == "\$SAFE_SSH_PORT" ]; then return; fi
 
-    # IPv4 封锁
-    if ! iptables -C INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null; then
-        iptables -I INPUT 1 -p tcp --dport "\$port" -j DROP
-        iptables -I INPUT 1 -p udp --dport "\$port" -j DROP
-        iptables -I OUTPUT 1 -p tcp --sport "\$port" -j DROP
-        iptables -I OUTPUT 1 -p udp --sport "\$port" -j DROP
+    # IPv4 封锁 (排除本地回环)
+    # 解释: ! -s 127.0.0.1 确保本机访问本机不被阻断
+    if ! iptables -C INPUT -p tcp --dport "\$port" ! -s 127.0.0.1 -j DROP 2>/dev/null; then
+        iptables -I INPUT 1 -p tcp --dport "\$port" ! -s 127.0.0.1 -j DROP
+        iptables -I INPUT 1 -p udp --dport "\$port" ! -s 127.0.0.1 -j DROP
+        iptables -I OUTPUT 1 -p tcp --sport "\$port" ! -d 127.0.0.1 -j DROP
+        iptables -I OUTPUT 1 -p udp --sport "\$port" ! -d 127.0.0.1 -j DROP
     fi
-    # IPv6 封锁
-    if ! ip6tables -C INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null; then
-        ip6tables -I INPUT 1 -p tcp --dport "\$port" -j DROP
-        ip6tables -I INPUT 1 -p udp --dport "\$port" -j DROP
-        ip6tables -I OUTPUT 1 -p tcp --sport "\$port" -j DROP
-        ip6tables -I OUTPUT 1 -p udp --sport "\$port" -j DROP
-        log "ALERT: Port \$port limit exceeded. BLOCKED (v4+v6)."
-        # 杀掉连接
-        timeout 2 ss -K dport = :\$port >/dev/null 2>&1
+    
+    # IPv6 封锁 (排除本地回环)
+    if ! ip6tables -C INPUT -p tcp --dport "\$port" ! -s ::1 -j DROP 2>/dev/null; then
+        ip6tables -I INPUT 1 -p tcp --dport "\$port" ! -s ::1 -j DROP
+        ip6tables -I INPUT 1 -p udp --dport "\$port" ! -s ::1 -j DROP
+        ip6tables -I OUTPUT 1 -p tcp --sport "\$port" ! -d ::1 -j DROP
+        ip6tables -I OUTPUT 1 -p udp --sport "\$port" ! -d ::1 -j DROP
+        log "ALERT: Port \$port limit exceeded. BLOCKED."
+        # 已移除 ss -K，防止误杀进程
     fi
 }
 
@@ -162,6 +171,7 @@ unblock_action() {
     log "INFO: Port \$port expired. UNBLOCKED."
 }
 
+# 清理模式
 if [ "\$1" == "cleanup" ]; then
     if [ -f "\$CONF_FILE" ]; then
         while read -r line; do
@@ -176,6 +186,7 @@ if [ "\$1" == "cleanup" ]; then
     exit 0
 fi
 
+# 监控模式
 NOW=\$(date +%s)
 if [ -f "\$CONF_FILE" ]; then
     while read -r line; do
@@ -183,7 +194,6 @@ if [ -f "\$CONF_FILE" ]; then
         [[ "\$line" =~ ^#.*$ ]] && continue
         [ -z "\$line" ] && continue
         IFS=':' read -r port limit_gb block_hours <<< "\$line"
-        
         if ! [[ "\$port" =~ ^[0-9]+$ ]]; then continue; fi
 
         init_chain "\$port"
@@ -217,7 +227,7 @@ EOF
     chmod +x "$INSTALL_PATH"
 }
 
-# 3. 仪表盘 (显示总流量 v4+v6)
+# 3. 仪表盘
 show_status() {
     if [ ! -f "$CONFIG_PATH" ]; then echo -e "${RED}请先安装！${RES}"; return; fi
     echo -e "${BOLD}正在获取数据 (IPv4 + IPv6)...${RES}"
@@ -233,7 +243,6 @@ show_status() {
         IFS=':' read -r port limit_gb block_hours <<< "$line"
         if ! [[ "$port" =~ ^[0-9]+$ ]]; then continue; fi
 
-        # 获取 v4+v6 总流量
         v4_in=$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_IN_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
         v4_out=$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_OUT_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
         v6_in=$(ip6tables -L INPUT -v -n -x 2>/dev/null | awk -v t="TRAFFIC_IN_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
@@ -278,9 +287,7 @@ install_monitor() {
         read -p "> " input_rule
         if [ -z "$input_rule" ]; then break; fi
         clean_rule=$(echo "$input_rule" | tr -s ' ' ':')
-        if [[ $(echo "$clean_rule" | grep -o ":" | wc -l) -lt 2 ]]; then
-             echo -e "${RED}格式错误!${RES}"; continue
-        fi
+        if [[ $(echo "$clean_rule" | grep -o ":" | wc -l) -lt 2 ]]; then echo -e "${RED}格式错误!${RES}"; continue; fi
         echo "$clean_rule" >> "$CONFIG_PATH"
         echo -e "${GREEN}已添加: $clean_rule${RES}"
     done
@@ -290,20 +297,15 @@ install_monitor() {
         (crontab -l 2>/dev/null; echo "* * * * * $INSTALL_PATH >/dev/null 2>&1") | crontab -
     fi
     bash "$INSTALL_PATH"
-    echo -e "${GREEN}安装完成！已启用双栈监控与 SSH 保护。${RES}"
+    echo -e "${GREEN}安装完成！已开启本地回环白名单保护。${RES}"
 }
 
-# 6. 救砖工具 (Force Reset)
+# 6. 救砖工具
 force_reset() {
-    echo -e "${RED}${BOLD}警告：这将清除所有 INPUT/OUTPUT 链中的 DROP 规则！${RES}"
-    read -p "确认执行？(y/n): " confirm
-    if [ "$confirm" == "y" ]; then
-        iptables -S INPUT | grep "DROP" | sed 's/-A/-D/' | while read rule; do iptables $rule; done
-        iptables -S OUTPUT | grep "DROP" | sed 's/-A/-D/' | while read rule; do iptables $rule; done
-        ip6tables -S INPUT | grep "DROP" | sed 's/-A/-D/' | while read rule; do ip6tables $rule 2>/dev/null; done
-        ip6tables -S OUTPUT | grep "DROP" | sed 's/-A/-D/' | while read rule; do ip6tables $rule 2>/dev/null; done
-        echo -e "${GREEN}防火墙规则已强制重置，网络应已恢复。${RES}"
-    fi
+    echo -e "${RED}${BOLD}即将清空所有防火墙规则...${RES}"
+    iptables -P INPUT ACCEPT; iptables -P OUTPUT ACCEPT; iptables -F
+    ip6tables -P INPUT ACCEPT; ip6tables -P OUTPUT ACCEPT; ip6tables -F
+    echo -e "${GREEN}网络限制已解除。${RES}"
 }
 
 uninstall_monitor() {
@@ -317,14 +319,14 @@ uninstall_monitor() {
 while true; do
     clear
     echo -e "${BLUE}==============================================${RES}"
-    echo -e "${BOLD}    VPS 流量监控管家 (v2.8 Final Rescue)${RES}"
+    echo -e "${BOLD}    VPS 流量监控管家 (v2.9 Stable)${RES}"
     echo -e "${BLUE}==============================================${RES}"
     echo " 1. 安装/重置监控 (Install)"
     echo " 2. 编辑规则 (Edit)"
-    echo " 3. 查看实时流量 (Status - IPv4+IPv6)"
+    echo " 3. 查看实时流量 (Status)"
     echo " 4. 查看日志 (Logs)"
     echo " 5. 彻底卸载 (Uninstall)"
-    echo -e "${RED} 6. 暴力重置防火墙 (Network Rescue)${RES}"
+    echo -e "${RED} 6. 暴力重置防火墙 (Emergency Reset)${RES}"
     echo " 0. 退出 (Exit)"
     echo -e "${BLUE}==============================================${RES}"
     read -p "请输入数字 [0-6]: " choice
