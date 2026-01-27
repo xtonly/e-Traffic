@@ -1,22 +1,20 @@
 #!/bin/bash
 # ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v3.7 Format-Fix
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v3.8 Compatibility
 # 修复日志：
-# 1. [核心修复] 增加 Windows 换行符 (\r) 自动清洗，彻底解决 syntax error
-# 2. [稳健] 强化 SSH 端口变量获取逻辑，防止含有换行符导致脚本断裂
-# 3. [兼容] 优化 Shell 判断语法，提升对旧版 Bash/Dash 的兼容性
+# 1. [关键] 引入 "Stateful" 状态检测：强制放行已建立连接，防止断流
+# 2. [白名单] 新增 "Self-IP" 白名单：自动放行公网IP的回环流量，修复Hairpin NAT问题
+# 3. [安全] 卸载/解封逻辑优化：只删除特定规则，绝不执行 iptables -F (防止误删代理规则)
 # ==============================================================
 
-# --- 环境变量注入 ---
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# --- 全局配置 ---
-INSTALL_PATH="/usr/local/bin/traffic_guard.sh"
 CONFIG_PATH="/etc/traffic_guard.conf"
 LOG_FILE="/var/log/traffic_guard.log"
 LOCK_DIR="/tmp/traffic_guard_locks"
+INSTALL_PATH="/usr/local/bin/traffic_guard.sh"
 
-# --- 颜色定义 ---
+# 颜色
 RES='\033[0m'
 RED='\033[31m'
 GREEN='\033[32m'
@@ -24,30 +22,25 @@ YELLOW='\033[33m'
 BLUE='\033[34m'
 BOLD='\033[1m'
 
-pause_and_return() {
-    echo ""
-    read -n 1 -s -r -p ">>> 按任意键返回主菜单..."
-}
+pause_and_return() { echo ""; read -n 1 -s -r -p ">>> 按任意键返回主菜单..."; }
 
 check_dependencies() {
     if [ -f /etc/redhat-release ]; then CMD="yum install -y"; else CMD="apt-get install -y"; fi
     for pkg in bc iptables ip6tables nano net-tools cronie; do
-        if ! command -v $pkg &> /dev/null; then
-            echo -e "${YELLOW}正在安装依赖: $pkg ...${RES}"
-            $CMD $pkg >/dev/null 2>&1
-        fi
+        if ! command -v $pkg &> /dev/null; then echo -e "${YELLOW}安装依赖: $pkg${RES}"; $CMD $pkg >/dev/null 2>&1; fi
     done
     systemctl enable crond >/dev/null 2>&1
     systemctl start crond >/dev/null 2>&1
 }
 
 create_monitor_script() {
-    # 强化获取 SSH 端口：去除空格、换行符，防止破坏脚本结构
+    # 1. 获取 SSH 端口
     SSH_PORT=$(netstat -tnlp 2>/dev/null | grep sshd | awk '{print $4}' | awk -F: '{print $NF}' | head -n 1 | tr -d '[:space:]')
+    [ -z "$SSH_PORT" ] && SSH_PORT=22
     
-    # 如果没获取到，默认为 22
-    if [ -z "$SSH_PORT" ]; then SSH_PORT=22; fi
-
+    # 2. 获取本机公网 IP (用于白名单)
+    MY_IP=$(curl -s4 ifconfig.me | tr -d '[:space:]')
+    
     cat > "$INSTALL_PATH" << EOF
 #!/bin/bash
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -56,73 +49,77 @@ CONF_FILE="/etc/traffic_guard.conf"
 LOG_FILE="/var/log/traffic_guard.log"
 LOCK_DIR="/tmp/traffic_guard_locks"
 SAFE_SSH_PORT="$SSH_PORT"
+SELF_IP="$MY_IP"
 
 mkdir -p "\$LOCK_DIR"
 log() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG_FILE"; }
 
-# --- 核心功能：强制确立防火墙宪法 (lo 第一) ---
-enforce_whitelist() {
-    # 确保 IPv4 本地回环放行在第一条
+# --- 核心：建立安全基石 (Stateful + Whitelist) ---
+setup_foundation() {
+    # 1. 放行所有 "已建立" 连接 (Stateful)
+    # 这确保了正常的业务流量不会被脚本误杀中断
+    if ! iptables -C INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; then
+        iptables -I INPUT 1 -m state --state ESTABLISHED,RELATED -j ACCEPT
+    fi
+    if ! ip6tables -C INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; then
+        ip6tables -I INPUT 1 -m state --state ESTABLISHED,RELATED -j ACCEPT
+    fi
+
+    # 2. 放行 lo (本地回环)
     if ! iptables -C INPUT -i lo -j ACCEPT 2>/dev/null; then
-        iptables -I INPUT 1 -i lo -j ACCEPT
+        iptables -I INPUT 2 -i lo -j ACCEPT
+    fi
+    if ! ip6tables -C INPUT -i lo -j ACCEPT 2>/dev/null; then
+        ip6tables -I INPUT 2 -i lo -j ACCEPT
     fi
     
-    # 确保 IPv6 本地回环放行在第一条
-    if ! ip6tables -C INPUT -i lo -j ACCEPT 2>/dev/null; then
-        ip6tables -I INPUT 1 -i lo -j ACCEPT
+    # 3. 放行本机公网 IP (解决 Hairpin NAT 问题)
+    if [ ! -z "\$SELF_IP" ]; then
+        if ! iptables -C INPUT -s "\$SELF_IP" -j ACCEPT 2>/dev/null; then
+            iptables -I INPUT 3 -s "\$SELF_IP" -j ACCEPT
+        fi
     fi
 }
 
 clean_rules() {
     local port=\$1
-    # 兼容性更强的数字判断
     if ! echo "\$port" | grep -qE '^[0-9]+$'; then return; fi
     
-    # --- 暴力循环清理 IPv4 ---
-    while iptables -D INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null; do :; done
-    while iptables -D INPUT -p udp --dport "\$port" ! -i lo -j DROP 2>/dev/null; do :; done
+    # 精准删除封禁规则 (不再暴力 flush)
     while iptables -D INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null; do :; done
     while iptables -D INPUT -p udp --dport "\$port" -j DROP 2>/dev/null; do :; done
+    while ip6tables -D INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null; do :; done
+    while ip6tables -D INPUT -p udp --dport "\$port" -j DROP 2>/dev/null; do :; done
     
-    # 清理 OUTPUT
-    while iptables -D OUTPUT -p tcp --sport "\$port" -j DROP 2>/dev/null; do :; done
-    while iptables -D OUTPUT -p udp --sport "\$port" -j DROP 2>/dev/null; do :; done
-
     # 清理计数链
-    while iptables -D INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; do :; done
-    while iptables -D INPUT -p udp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; do :; done
-    while iptables -D OUTPUT -p tcp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null; do :; done
-    while iptables -D OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null; do :; done
-    
     iptables -F "TRAFFIC_IN_\$port" 2>/dev/null
     iptables -X "TRAFFIC_IN_\$port" 2>/dev/null
     iptables -F "TRAFFIC_OUT_\$port" 2>/dev/null
     iptables -X "TRAFFIC_OUT_\$port" 2>/dev/null
-
-    # --- 暴力循环清理 IPv6 ---
-    while ip6tables -D INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null; do :; done
-    while ip6tables -D INPUT -p udp --dport "\$port" ! -i lo -j DROP 2>/dev/null; do :; done
-    while ip6tables -D INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null; do :; done
-    while ip6tables -D INPUT -p udp --dport "\$port" -j DROP 2>/dev/null; do :; done
-
-    while ip6tables -D INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; do :; done
-    while ip6tables -D INPUT -p udp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; do :; done
-    while ip6tables -D OUTPUT -p tcp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null; do :; done
-    while ip6tables -D OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null; do :; done
     
     ip6tables -F "TRAFFIC_IN_\$port" 2>/dev/null
     ip6tables -X "TRAFFIC_IN_\$port" 2>/dev/null
     ip6tables -F "TRAFFIC_OUT_\$port" 2>/dev/null
     ip6tables -X "TRAFFIC_OUT_\$port" 2>/dev/null
+    
+    # 清理引用 (从 INPUT/OUTPUT 链中移除跳转)
+    iptables -D INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null
+    iptables -D INPUT -p udp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null
+    iptables -D OUTPUT -p tcp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null
+    iptables -D OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null
+    
+    ip6tables -D INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null
+    ip6tables -D INPUT -p udp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null
+    ip6tables -D OUTPUT -p tcp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null
+    ip6tables -D OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port" 2>/dev/null
 }
 
 init_chain() {
     local port=\$1
     if ! echo "\$port" | grep -qE '^[0-9]+$'; then return; fi
-    
-    enforce_whitelist
+    setup_foundation
 
-    # IPv4 计数链
+    # 建立计数链 (追加到末尾，不影响前面的白名单)
     iptables -N "TRAFFIC_IN_\$port" 2>/dev/null
     if ! iptables -C INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; then
         iptables -A INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port"
@@ -134,7 +131,6 @@ init_chain() {
         iptables -A OUTPUT -p udp --sport "\$port" -j "TRAFFIC_OUT_\$port"
     fi
 
-    # IPv6 计数链
     ip6tables -N "TRAFFIC_IN_\$port" 2>/dev/null
     if ! ip6tables -C INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port" 2>/dev/null; then
         ip6tables -A INPUT -p tcp --dport "\$port" -j "TRAFFIC_IN_\$port"
@@ -160,23 +156,20 @@ get_bytes() {
 block_action() {
     local port=\$1
     if [ -z "\$port" ]; then return; fi
-    # 安全判断：如果端口不是数字，或者等于 SSH 端口，则跳过
     if ! echo "\$port" | grep -qE '^[0-9]+$'; then return; fi
     if [ "\$port" == "\$SAFE_SSH_PORT" ]; then return; fi
     
-    enforce_whitelist
+    setup_foundation
 
-    # IPv4 封锁 (Index 2)
-    if ! iptables -C INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null; then
-        iptables -I INPUT 2 -p tcp --dport "\$port" ! -i lo -j DROP
-        iptables -I INPUT 2 -p udp --dport "\$port" ! -i lo -j DROP
+    # 封禁规则：插入到 Index 4 (在所有白名单之后)
+    if ! iptables -C INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null; then
+        iptables -I INPUT 4 -p tcp --dport "\$port" -j DROP
+        iptables -I INPUT 4 -p udp --dport "\$port" -j DROP
     fi
-    
-    # IPv6 封锁 (Index 2)
-    if ! ip6tables -C INPUT -p tcp --dport "\$port" ! -i lo -j DROP 2>/dev/null; then
-        ip6tables -I INPUT 2 -p tcp --dport "\$port" ! -i lo -j DROP
-        ip6tables -I INPUT 2 -p udp --dport "\$port" ! -i lo -j DROP
-        log "ALERT: Port \$port reached limit. BLOCKED."
+    if ! ip6tables -C INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null; then
+        ip6tables -I INPUT 4 -p tcp --dport "\$port" -j DROP
+        ip6tables -I INPUT 4 -p udp --dport "\$port" -j DROP
+        log "ALERT: Port \$port BLOCKED."
     fi
 }
 
@@ -184,7 +177,7 @@ unblock_action() {
     local port=\$1
     clean_rules "\$port"
     init_chain "\$port"
-    log "INFO: Port \$port expired. UNBLOCKED."
+    log "INFO: Port \$port UNBLOCKED."
 }
 
 if [ "\$1" == "cleanup" ]; then
@@ -203,15 +196,12 @@ fi
 
 NOW=\$(date +%s)
 if [ -f "\$CONF_FILE" ]; then
-    enforce_whitelist
-    
+    setup_foundation
     while read -r line; do
         line=\$(echo "\$line" | tr -d '\r')
         [[ "\$line" =~ ^#.*$ ]] && continue
         [ -z "\$line" ] && continue
         IFS=':' read -r port limit_gb raw_time <<< "\$line"
-        
-        # 兼容性判断
         if ! echo "\$port" | grep -qE '^[0-9]+$'; then continue; fi
 
         init_chain "\$port"
@@ -228,7 +218,6 @@ if [ -f "\$CONF_FILE" ]; then
             block_time=\$(cat "\$lock_file")
             [ -z "\$block_time" ] && block_time=\$NOW && echo \$NOW > "\$lock_file"
             elapsed=\$((\$NOW - \$block_time))
-            
             if [ "\$elapsed" -ge "\$unlock_sec" ]; then
                 unblock_action "\$port"
                 rm -f "\$lock_file"
@@ -239,30 +228,24 @@ if [ -f "\$CONF_FILE" ]; then
         fi
         
         total_bytes=\$(get_bytes "\$port")
-        if ! command -v bc &> /dev/null; then log "Error: bc not found"; continue; fi
+        if ! command -v bc &> /dev/null; then continue; fi
         limit_bytes=\$(echo "\$limit_gb * 1024 * 1024 * 1024" | bc | cut -d. -f1)
         
         if [ "\$total_bytes" -ge "\$limit_bytes" ]; then
             echo "\$NOW" > "\$lock_file"
             block_action "\$port"
-            log "Port \$port reached limit (\${limit_gb}GB). Blocking."
+            log "Port \$port limit reached. Blocking."
         fi
     done < "\$CONF_FILE"
 fi
 EOF
-    
-    # !!! 关键修复步骤 !!!
-    # 使用 sed 剔除文件中可能存在的 Windows 换行符 (\r)
-    # 这能解决 "syntax error near unexpected token" 问题
     sed -i 's/\r//g' "$INSTALL_PATH"
-    
     chmod +x "$INSTALL_PATH"
 }
 
-# 3. 仪表盘
 show_status() {
     if [ ! -f "$CONFIG_PATH" ]; then echo -e "${RED}请先安装！${RES}"; return; fi
-    echo -e "${BOLD}正在获取数据 (IPv4 + IPv6)...${RES}"
+    echo -e "${BOLD}实时数据 (IPv4+IPv6)${RES}"
     SEP="+----------+----------------+----------------+----------+------------+"
     echo "$SEP"
     printf "| %-8s | %-14s | %-14s | %-8s | %-10s |\n" " PORT" " USED" " LIMIT" " USAGE" " STATUS"
@@ -306,7 +289,6 @@ show_status() {
     done < "$CONFIG_PATH"
 }
 
-# 4. 安装
 install_monitor() {
     check_dependencies
     echo "--------------------------------------------------------"
@@ -332,14 +314,13 @@ install_monitor() {
     fi
     systemctl restart crond >/dev/null 2>&1
     bash "$INSTALL_PATH"
-    echo -e "${GREEN}安装完成！${RES}"
+    echo -e "${GREEN}安装完成！已启用白名单保护 (Self-IP + Established)。${RES}"
 }
 
-force_reset() {
-    echo -e "${RED}${BOLD}即将清空所有防火墙规则...${RES}"
-    iptables -P INPUT ACCEPT; iptables -P OUTPUT ACCEPT; iptables -F
-    ip6tables -P INPUT ACCEPT; ip6tables -P OUTPUT ACCEPT; ip6tables -F
-    echo -e "${GREEN}网络限制已解除。${RES}"
+restart_proxy() {
+    echo -e "${BOLD}尝试重启代理服务以修复规则...${RES}"
+    systemctl restart shoes 2>/dev/null || systemctl restart eshoes 2>/dev/null || systemctl restart xray 2>/dev/null
+    echo -e "${GREEN}服务重启尝试完成。${RES}"
 }
 
 uninstall_monitor() {
@@ -359,14 +340,14 @@ manual_check() {
 while true; do
     clear
     echo -e "${BLUE}==============================================${RES}"
-    echo -e "${BOLD}    VPS 流量监控管家 (v3.7 Format Fix)${RES}"
+    echo -e "${BOLD}    VPS 流量监控管家 (v3.8 Final Compat)${RES}"
     echo -e "${BLUE}==============================================${RES}"
     echo " 1. 安装/重置监控 (Install)"
     echo " 2. 编辑规则 (Edit)"
     echo " 3. 查看实时流量 (Status)"
     echo " 4. 查看日志 (Logs)"
     echo " 5. 彻底卸载 (Uninstall)"
-    echo " 6. 暴力重置防火墙 (Reset Firewall)"
+    echo -e "${YELLOW} 6. 修复代理服务 (Restart Proxy)${RES}"
     echo -e "${YELLOW} 7. 手动强制执行检测 (Force Check)${RES}"
     echo " 0. 退出 (Exit)"
     echo -e "${BLUE}==============================================${RES}"
@@ -377,7 +358,7 @@ while true; do
         3) show_status; pause_and_return ;;
         4) [ -f "$LOG_FILE" ] && tail -n 20 "$LOG_FILE" || echo "无日志"; pause_and_return ;;
         5) uninstall_monitor; pause_and_return ;;
-        6) force_reset; pause_and_return ;;
+        6) restart_proxy; pause_and_return ;;
         7) manual_check; pause_and_return ;;
         0) exit 0 ;;
         *) sleep 1 ;;
