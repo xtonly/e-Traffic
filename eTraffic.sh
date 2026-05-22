@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v5.2 Ultimate
-# 融合极致排版UI、Mangle表防Docker穿透、支持三大主流云厂计费模式
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v5.3 Ultimate
+# 修复底层 Mangle 空链统计漏洞，实现精确到字节的端口计费闭环
 # ==============================================================
 
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -102,7 +102,6 @@ MAIN_IFACE="$DEFAULT_IFACE"
 mkdir -p "\$LOCK_DIR"
 log() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG_FILE"; }
 
-# 核心计算逻辑引擎 (适配云厂商三大计费标准)
 T_MODE=1
 [ -f "\$CONF_MODE" ] && source "\$CONF_MODE"
 
@@ -118,16 +117,13 @@ calc_bytes() {
     fi
 }
 
-# --- 终极核心：使用 mangle 表防 Docker NAT 穿透 ---
 setup_foundation() {
     for cmd in iptables ip6tables; do
-        # 1. 记账层 (挂载在 Mangle 表，在数据被 Docker 篡改前抓取)
         \$cmd -t mangle -N TG_ACCT_IN 2>/dev/null
         \$cmd -t mangle -N TG_ACCT_OUT 2>/dev/null
         if ! \$cmd -t mangle -C PREROUTING -j TG_ACCT_IN 2>/dev/null; then \$cmd -t mangle -I PREROUTING 1 -j TG_ACCT_IN; fi
         if ! \$cmd -t mangle -C POSTROUTING -j TG_ACCT_OUT 2>/dev/null; then \$cmd -t mangle -I POSTROUTING 1 -j TG_ACCT_OUT; fi
 
-        # 2. 阻断层与白名单 (挂载在 Filter 表，阻断超额连接)
         \$cmd -t filter -N TG_BLOCK 2>/dev/null
         \$cmd -t filter -N TG_SAFE 2>/dev/null
         if ! \$cmd -t filter -C INPUT -j TG_SAFE 2>/dev/null; then \$cmd -t filter -I INPUT 1 -j TG_SAFE; fi
@@ -135,7 +131,6 @@ setup_foundation() {
         if ! \$cmd -t filter -C FORWARD -j TG_SAFE 2>/dev/null; then \$cmd -t filter -I FORWARD 1 -j TG_SAFE; fi
         if ! \$cmd -t filter -C FORWARD -j TG_BLOCK 2>/dev/null; then \$cmd -t filter -I FORWARD 1 -j TG_BLOCK; fi
 
-        # 填充防断流白名单
         if ! \$cmd -t filter -C TG_SAFE -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; then
             \$cmd -t filter -A TG_SAFE -m state --state ESTABLISHED,RELATED -j ACCEPT
         fi
@@ -175,6 +170,10 @@ init_port_chain() {
         \$cmd -t mangle -N "T_IN_\$port" 2>/dev/null
         \$cmd -t mangle -N "T_OUT_\$port" 2>/dev/null
         
+        # [核心修复]: 注入 RETURN 记账锚点，解决空链导致 awk 读不到行的问题
+        \$cmd -t mangle -C "T_IN_\$port" -j RETURN 2>/dev/null || \$cmd -t mangle -A "T_IN_\$port" -j RETURN
+        \$cmd -t mangle -C "T_OUT_\$port" -j RETURN 2>/dev/null || \$cmd -t mangle -A "T_OUT_\$port" -j RETURN
+        
         \$cmd -t mangle -C TG_ACCT_IN -p tcp --dport "\$port" -j "T_IN_\$port" 2>/dev/null || \$cmd -t mangle -A TG_ACCT_IN -p tcp --dport "\$port" -j "T_IN_\$port"
         \$cmd -t mangle -C TG_ACCT_IN -p udp --dport "\$port" -j "T_IN_\$port" 2>/dev/null || \$cmd -t mangle -A TG_ACCT_IN -p udp --dport "\$port" -j "T_IN_\$port"
         
@@ -195,10 +194,11 @@ get_global_bytes() {
 
 get_port_bytes() {
     local p=\$1
-    local v4_i=\$(iptables -t mangle -L T_IN_\$p -v -n -x 2>/dev/null | awk '{sum+=\$2} END {printf "%.0f", sum}')
-    local v4_o=\$(iptables -t mangle -L T_OUT_\$p -v -n -x 2>/dev/null | awk '{sum+=\$2} END {printf "%.0f", sum}')
-    local v6_i=\$(ip6tables -t mangle -L T_IN_\$p -v -n -x 2>/dev/null | awk '{sum+=\$2} END {printf "%.0f", sum}')
-    local v6_o=\$(ip6tables -t mangle -L T_OUT_\$p -v -n -x 2>/dev/null | awk '{sum+=\$2} END {printf "%.0f", sum}')
+    # [核心修复]: 强制只读取第3行（真实数据行），完美过滤表头避免 awk 错误累加
+    local v4_i=\$(iptables -t mangle -L T_IN_\$p -v -n -x 2>/dev/null | awk 'NR>2 {sum+=\$2} END {printf "%.0f", sum}')
+    local v4_o=\$(iptables -t mangle -L T_OUT_\$p -v -n -x 2>/dev/null | awk 'NR>2 {sum+=\$2} END {printf "%.0f", sum}')
+    local v6_i=\$(ip6tables -t mangle -L T_IN_\$p -v -n -x 2>/dev/null | awk 'NR>2 {sum+=\$2} END {printf "%.0f", sum}')
+    local v6_o=\$(ip6tables -t mangle -L T_OUT_\$p -v -n -x 2>/dev/null | awk 'NR>2 {sum+=\$2} END {printf "%.0f", sum}')
     local total_in=\$((\${v4_i:-0} + \${v6_i:-0}))
     local total_out=\$((\${v4_o:-0} + \${v6_o:-0}))
     calc_bytes \$total_in \$total_out
@@ -367,10 +367,10 @@ show_status() {
     port_total_bytes=0
 
     for port in $active_chains; do
-        v4_i=$(iptables -t mangle -L T_IN_$port -v -n -x 2>/dev/null | awk '{sum+=$2} END {printf "%.0f", sum}')
-        v4_o=$(iptables -t mangle -L T_OUT_$port -v -n -x 2>/dev/null | awk '{sum+=$2} END {printf "%.0f", sum}')
-        v6_i=$(ip6tables -t mangle -L T_IN_$port -v -n -x 2>/dev/null | awk '{sum+=$2} END {printf "%.0f", sum}')
-        v6_o=$(ip6tables -t mangle -L T_OUT_$port -v -n -x 2>/dev/null | awk '{sum+=$2} END {printf "%.0f", sum}')
+        v4_i=$(iptables -t mangle -L T_IN_$port -v -n -x 2>/dev/null | awk 'NR>2 {sum+=$2} END {printf "%.0f", sum}')
+        v4_o=$(iptables -t mangle -L T_OUT_$port -v -n -x 2>/dev/null | awk 'NR>2 {sum+=$2} END {printf "%.0f", sum}')
+        v6_i=$(ip6tables -t mangle -L T_IN_$port -v -n -x 2>/dev/null | awk 'NR>2 {sum+=$2} END {printf "%.0f", sum}')
+        v6_o=$(ip6tables -t mangle -L T_OUT_$port -v -n -x 2>/dev/null | awk 'NR>2 {sum+=$2} END {printf "%.0f", sum}')
         
         p_in=$((${v4_i:-0} + ${v6_i:-0}))
         p_out=$((${v4_o:-0} + ${v6_o:-0}))
@@ -420,6 +420,7 @@ show_status() {
     done
 
     misc_bytes=$((g_bytes - port_total_bytes))
+    # 允许负误差（比如清空计数器时的临界点），只展示正的杂项流量
     if [ "$misc_bytes" -gt 104857 ]; then
         if [ "$misc_bytes" -gt 1073741824 ]; then
             misc_h=$(awk -v b="$misc_bytes" 'BEGIN {printf "%.2f", b/1073741824}')
@@ -503,7 +504,6 @@ service_uninstall() {
     rm -f "$INSTALL_PATH" "$CONFIG_PORT" "$CONFIG_GLOBAL" "$CONFIG_MODE" "$LOG_FILE"
     rm -rf "$LOCK_DIR"
     
-    # 彻底拆除所有 Mangle 和 Filter 链
     for cmd in iptables ip6tables; do
         $cmd -t mangle -D PREROUTING -j TG_ACCT_IN 2>/dev/null
         $cmd -t mangle -D POSTROUTING -j TG_ACCT_OUT 2>/dev/null
@@ -534,7 +534,7 @@ service_uninstall() {
 while true; do
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}             VPS 流量监控与全网管家 5.2                     ${RESET}"
+    echo -e "${CYAN}             VPS 流量监控与全网管家 5.3                     ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}系统环境 :${RESET} ${WHITE}${SYS_PRETTY_NAME}${RESET}"
     echo -e " ${BLUE}出海网卡 :${RESET} ${WHITE}${DEFAULT_IFACE} ${YELLOW}(Mangle层防Docker穿透)${RESET}"
