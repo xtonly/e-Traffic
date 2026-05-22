@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v4.5 Ultimate
-# 融合极致排版UI、全局网卡监控、内外网分离与全自动端口嗅探审计
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v5.0 Ultimate
+# 融合极致排版UI、全局网卡监控、内外网分离与绝对底层记账链架构
 # ==============================================================
 
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -31,11 +31,9 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-# 探测出海主网卡
 DEFAULT_IFACE=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
 [[ -z "$DEFAULT_IFACE" ]] && DEFAULT_IFACE="eth0"
 
-# 提取系统信息
 if [ -f /etc/os-release ]; then
     . /etc/os-release
     SYS_PRETTY_NAME=${PRETTY_NAME}
@@ -51,7 +49,6 @@ pause_and_return() { echo ""; read -n 1 -s -r -p ">>> 按任意键返回主菜�
 check_dependencies() {
     local missing_pkgs=""
 
-    # 区分不同系统的包管理器和部分包名差异
     if [ -f /etc/redhat-release ]; then 
         CMD="yum install -y"
         CRON_PKG="cronie"
@@ -60,7 +57,6 @@ check_dependencies() {
         CRON_PKG="cron"
     fi
 
-    # 精准检测具体命令对应的包是否缺失
     ! command -v bc &> /dev/null && missing_pkgs+=" bc"
     ! command -v iptables &> /dev/null && missing_pkgs+=" iptables"
     ! command -v nano &> /dev/null && missing_pkgs+=" nano"
@@ -69,30 +65,24 @@ check_dependencies() {
     ! command -v ip &> /dev/null && missing_pkgs+=" iproute2"
     ! command -v jq &> /dev/null && missing_pkgs+=" jq"
 
-    # 如果存在缺失的包，则一次性静默安装
     if [ -n "$missing_pkgs" ]; then
         echo -e "${YELLOW}--> 正在集中安装缺失的依赖: ${missing_pkgs}${RESET}"
-        if [[ "$CMD" == *"apt-get"* ]]; then
-            apt-get update >/dev/null 2>&1
-        fi
+        if [[ "$CMD" == *"apt-get"* ]]; then apt-get update >/dev/null 2>&1; fi
         $CMD $missing_pkgs >/dev/null 2>&1
     fi
 
-    # 确保计划任务服务自启并运行
     systemctl enable crond >/dev/null 2>&1 || systemctl enable cron >/dev/null 2>&1
     systemctl start crond >/dev/null 2>&1 || systemctl start cron >/dev/null 2>&1
 }
 
 # ================== 核心守护进程生成引擎 ==================
 create_monitor_script() {
-    # 1. 自动提取真实的 SSH 端口 (作为绝对白名单防御，防止把自己锁死)
     SSH_PORT=$(sshd -T 2>/dev/null | grep -i "^port " | head -n 1 | awk '{print $2}' | tr -d '\r\n')
     if [[ -z "$SSH_PORT" || ! "$SSH_PORT" =~ ^[0-9]+$ ]]; then
         SSH_PORT=$(grep -iE "^Port\s+[0-9]+" /etc/ssh/sshd_config | head -n 1 | awk '{print $2}' | tr -d '\r\n')
     fi
     [[ -z "$SSH_PORT" || ! "$SSH_PORT" =~ ^[0-9]+$ ]] && SSH_PORT=22
     
-    # 2. 获取本机公网 IP (用于解决 Hairpin NAT 问题)
     MY_IP=$(curl -s4 ifconfig.me | tr -d '[:space:]')
     
     cat > "$INSTALL_PATH" << EOF
@@ -110,63 +100,71 @@ MAIN_IFACE="$DEFAULT_IFACE"
 mkdir -p "\$LOCK_DIR"
 log() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG_FILE"; }
 
-# --- 核心安全基石 ---
+# --- 终极核心：重构防火墙链架构 ---
 setup_foundation() {
-    # Stateful 放行：保障已有业务不断流
     for cmd in iptables ip6tables; do
-        if ! \$cmd -C INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; then
-            \$cmd -I INPUT 1 -m state --state ESTABLISHED,RELATED -j ACCEPT
+        # 创建我们私有的三层处理链
+        \$cmd -N TG_ACCT_IN 2>/dev/null
+        \$cmd -N TG_ACCT_OUT 2>/dev/null
+        \$cmd -N TG_BLOCK 2>/dev/null
+        \$cmd -N TG_SAFE 2>/dev/null
+        
+        # 严格按照从上到下的顺序挂载：记账(第一) -> 阻断(第二) -> 白名单(第三)
+        if ! \$cmd -C INPUT -j TG_SAFE 2>/dev/null; then \$cmd -I INPUT 1 -j TG_SAFE; fi
+        if ! \$cmd -C INPUT -j TG_BLOCK 2>/dev/null; then \$cmd -I INPUT 1 -j TG_BLOCK; fi
+        if ! \$cmd -C INPUT -j TG_ACCT_IN 2>/dev/null; then \$cmd -I INPUT 1 -j TG_ACCT_IN; fi
+        
+        if ! \$cmd -C OUTPUT -j TG_ACCT_OUT 2>/dev/null; then \$cmd -I OUTPUT 1 -j TG_ACCT_OUT; fi
+
+        # 填充防断流与防自锁白名单
+        if ! \$cmd -C TG_SAFE -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; then
+            \$cmd -A TG_SAFE -m state --state ESTABLISHED,RELATED -j ACCEPT
         fi
-        if ! \$cmd -C INPUT -i lo -j ACCEPT 2>/dev/null; then
-            \$cmd -I INPUT 2 -i lo -j ACCEPT
+        if ! \$cmd -C TG_SAFE -i lo -j ACCEPT 2>/dev/null; then
+            \$cmd -A TG_SAFE -i lo -j ACCEPT
         fi
     done
+    
+    # IPv4 专属节点自反白名单
     if [ ! -z "\$SELF_IP" ]; then
-        if ! iptables -C INPUT -s "\$SELF_IP" -j ACCEPT 2>/dev/null; then
-            iptables -I INPUT 3 -s "\$SELF_IP" -j ACCEPT
+        if ! iptables -C TG_SAFE -s "\$SELF_IP" -j ACCEPT 2>/dev/null; then
+            iptables -A TG_SAFE -s "\$SELF_IP" -j ACCEPT
         fi
     fi
 }
 
-# --- 全局内外网流量精准监控链 ---
 setup_global_accounting() {
-    # IPv4 外网审计
-    iptables -N G_IN 2>/dev/null
-    iptables -N G_OUT 2>/dev/null
-    iptables -C INPUT -i "\$MAIN_IFACE" -j G_IN 2>/dev/null || iptables -A INPUT -i "\$MAIN_IFACE" -j G_IN
-    iptables -C OUTPUT -o "\$MAIN_IFACE" -j G_OUT 2>/dev/null || iptables -A OUTPUT -o "\$MAIN_IFACE" -j G_OUT
-    
-    # 剔除内网网段
-    for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16; do
-        iptables -C G_IN -s \$net -j RETURN 2>/dev/null || iptables -A G_IN -s \$net -j RETURN
-        iptables -C G_OUT -d \$net -j RETURN 2>/dev/null || iptables -A G_OUT -d \$net -j RETURN
+    for cmd in iptables ip6tables; do
+        \$cmd -N G_IN 2>/dev/null
+        \$cmd -N G_OUT 2>/dev/null
+        
+        # 将流量计挂载到记账主链
+        \$cmd -C TG_ACCT_IN -i "\$MAIN_IFACE" -j G_IN 2>/dev/null || \$cmd -A TG_ACCT_IN -i "\$MAIN_IFACE" -j G_IN
+        \$cmd -C TG_ACCT_OUT -o "\$MAIN_IFACE" -j G_OUT 2>/dev/null || \$cmd -A TG_ACCT_OUT -o "\$MAIN_IFACE" -j G_OUT
+        
+        # 剔除内网网段
+        for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 fc00::/7 fe80::/10; do
+            \$cmd -C G_IN -s \$net -j RETURN 2>/dev/null || \$cmd -A G_IN -s \$net -j RETURN 2>/dev/null
+            \$cmd -C G_OUT -d \$net -j RETURN 2>/dev/null || \$cmd -A G_OUT -d \$net -j RETURN 2>/dev/null
+        done
+        
+        # 挂上注释签，方便统计
+        \$cmd -C G_IN -m comment --comment "Global_Ext_In" -j RETURN 2>/dev/null || \$cmd -A G_IN -m comment --comment "Global_Ext_In" -j RETURN
+        \$cmd -C G_OUT -m comment --comment "Global_Ext_Out" -j RETURN 2>/dev/null || \$cmd -A G_OUT -m comment --comment "Global_Ext_Out" -j RETURN
     done
-    # 标记公网流量落点 (挂载注释用于快速 grep 提取)
-    iptables -C G_IN -m comment --comment "Global_Ext_In" -j RETURN 2>/dev/null || iptables -A G_IN -m comment --comment "Global_Ext_In" -j RETURN
-    iptables -C G_OUT -m comment --comment "Global_Ext_Out" -j RETURN 2>/dev/null || iptables -A G_OUT -m comment --comment "Global_Ext_Out" -j RETURN
-
-    # IPv6 外网审计
-    ip6tables -N G_IN 2>/dev/null
-    ip6tables -N G_OUT 2>/dev/null
-    ip6tables -C INPUT -i "\$MAIN_IFACE" -j G_IN 2>/dev/null || ip6tables -A INPUT -i "\$MAIN_IFACE" -j G_IN
-    ip6tables -C OUTPUT -o "\$MAIN_IFACE" -j G_OUT 2>/dev/null || ip6tables -A OUTPUT -o "\$MAIN_IFACE" -j G_OUT
-    for net in fc00::/7 fe80::/10; do
-        ip6tables -C G_IN -s \$net -j RETURN 2>/dev/null || ip6tables -A G_IN -s \$net -j RETURN
-        ip6tables -C G_OUT -d \$net -j RETURN 2>/dev/null || ip6tables -A G_OUT -d \$net -j RETURN
-    done
-    ip6tables -C G_IN -m comment --comment "Global_Ext_In" -j RETURN 2>/dev/null || ip6tables -A G_IN -m comment --comment "Global_Ext_In" -j RETURN
-    ip6tables -C G_OUT -m comment --comment "Global_Ext_Out" -j RETURN 2>/dev/null || ip6tables -A G_OUT -m comment --comment "Global_Ext_Out" -j RETURN
 }
 
-# --- 端口级监控链 ---
 init_port_chain() {
     local port=\$1
     iptables -N "T_IN_\$port" 2>/dev/null
-    iptables -C INPUT -p tcp --dport "\$port" -j "T_IN_\$port" 2>/dev/null || iptables -A INPUT -p tcp --dport "\$port" -j "T_IN_\$port"
-    iptables -C INPUT -p udp --dport "\$port" -j "T_IN_\$port" 2>/dev/null || iptables -A INPUT -p udp --dport "\$port" -j "T_IN_\$port"
     iptables -N "T_OUT_\$port" 2>/dev/null
-    iptables -C OUTPUT -p tcp --sport "\$port" -j "T_OUT_\$port" 2>/dev/null || iptables -A OUTPUT -p tcp --sport "\$port" -j "T_OUT_\$port"
-    iptables -C OUTPUT -p udp --sport "\$port" -j "T_OUT_\$port" 2>/dev/null || iptables -A OUTPUT -p udp --sport "\$port" -j "T_OUT_\$port"
+    
+    # 将端口计费挂载到记账主链
+    iptables -C TG_ACCT_IN -p tcp --dport "\$port" -j "T_IN_\$port" 2>/dev/null || iptables -A TG_ACCT_IN -p tcp --dport "\$port" -j "T_IN_\$port"
+    iptables -C TG_ACCT_IN -p udp --dport "\$port" -j "T_IN_\$port" 2>/dev/null || iptables -A TG_ACCT_IN -p udp --dport "\$port" -j "T_IN_\$port"
+    
+    iptables -C TG_ACCT_OUT -p tcp --sport "\$port" -j "T_OUT_\$port" 2>/dev/null || iptables -A TG_ACCT_OUT -p tcp --sport "\$port" -j "T_OUT_\$port"
+    iptables -C TG_ACCT_OUT -p udp --sport "\$port" -j "T_OUT_\$port" 2>/dev/null || iptables -A TG_ACCT_OUT -p udp --sport "\$port" -j "T_OUT_\$port"
 }
 
 get_global_bytes() {
@@ -179,38 +177,28 @@ get_global_bytes() {
 
 get_port_bytes() {
     local p=\$1
-    local v4_i=\$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="T_IN_\$p" '\$3 == t {sum+=\$2} END {printf "%.0f", sum}')
-    local v4_o=\$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="T_OUT_\$p" '\$3 == t {sum+=\$2} END {printf "%.0f", sum}')
+    local v4_i=\$(iptables -L T_IN_\$p -v -n -x 2>/dev/null | awk '{sum+=\$2} END {printf "%.0f", sum}')
+    local v4_o=\$(iptables -L T_OUT_\$p -v -n -x 2>/dev/null | awk '{sum+=\$2} END {printf "%.0f", sum}')
     echo \$((\${v4_i:-0} + \${v4_o:-0}))
 }
 
-# --- 自动发现并注册活跃端口 ---
 auto_register_ports() {
-    # 自动抓取所有处于 LISTEN 状态的 TCP/UDP 服务端口 (规避了随机高端口的噪音)
     local active_ports=\$(ss -tuln | awk 'NR>1 {print \$5}' | awk -F: '{print \$NF}' | grep -E '^[0-9]+\$' | sort -nu)
-    for p in \$active_ports; do
-        init_port_chain "\$p"
-    done
-    
-    # 确保配置文件里设定的端口即使当前没运行，也保持监控链
+    for p in \$active_ports; do init_port_chain "\$p"; done
     if [ -f "\$CONF_PORT" ]; then
         while read -r line; do
             [[ -z "\$line" || "\$line" =~ ^#.*\$ ]] && continue
             local conf_p=\$(echo "\$line" | cut -d: -f1)
-            if echo "\$conf_p" | grep -qE '^[0-9]+\$'; then
-                init_port_chain "\$conf_p"
-            fi
+            if echo "\$conf_p" | grep -qE '^[0-9]+\$'; then init_port_chain "\$conf_p"; fi
         done < "\$CONF_PORT"
     fi
 }
 
-# ================= 主循环逻辑 =================
 NOW=\$(date +%s)
 setup_foundation
 setup_global_accounting
 auto_register_ports
 
-# 1. 检查全局限额
 if [ -f "\$CONF_GLOBAL" ]; then
     source "\$CONF_GLOBAL"
     if [ "\$GLOBAL_LIMIT_GB" -gt 0 ]; then
@@ -221,22 +209,22 @@ if [ -f "\$CONF_GLOBAL" ]; then
         if [ "\$cur_bytes" -ge "\$gb_bytes" ]; then
             if [ ! -f "\$lock_file" ]; then
                 touch "\$lock_file"
-                iptables -I INPUT 4 -i "\$MAIN_IFACE" -p tcp ! --dport "\$SAFE_SSH_PORT" -m comment --comment "GLOBAL_BLOCK" -j DROP
-                iptables -I INPUT 4 -i "\$MAIN_IFACE" -p udp -m comment --comment "GLOBAL_BLOCK" -j DROP
+                # 在阻断层执行拦截
+                iptables -I TG_BLOCK 1 -i "\$MAIN_IFACE" -p tcp ! --dport "\$SAFE_SSH_PORT" -m comment --comment "GLOBAL_BLOCK" -j DROP
+                iptables -I TG_BLOCK 1 -i "\$MAIN_IFACE" -p udp -m comment --comment "GLOBAL_BLOCK" -j DROP
                 log "CRITICAL: Global traffic limit reached! External access blocked."
             fi
         else
             if [ -f "\$lock_file" ]; then
                 rm -f "\$lock_file"
-                while iptables -D INPUT -i "\$MAIN_IFACE" -p tcp ! --dport "\$SAFE_SSH_PORT" -m comment --comment "GLOBAL_BLOCK" -j DROP 2>/dev/null; do :; done
-                while iptables -D INPUT -i "\$MAIN_IFACE" -p udp -m comment --comment "GLOBAL_BLOCK" -j DROP 2>/dev/null; do :; done
+                while iptables -D TG_BLOCK -i "\$MAIN_IFACE" -p tcp ! --dport "\$SAFE_SSH_PORT" -m comment --comment "GLOBAL_BLOCK" -j DROP 2>/dev/null; do :; done
+                while iptables -D TG_BLOCK -i "\$MAIN_IFACE" -p udp -m comment --comment "GLOBAL_BLOCK" -j DROP 2>/dev/null; do :; done
                 log "INFO: Global traffic lock released."
             fi
         fi
     fi
 fi
 
-# 2. 检查端口级限额 (只对配置了规则的端口执行封锁)
 if [ -f "\$CONF_PORT" ]; then
     while read -r line; do
         [[ -z "\$line" || "\$line" =~ ^#.*\$ ]] && continue
@@ -255,8 +243,8 @@ if [ -f "\$CONF_PORT" ]; then
             block_time=\$(cat "\$lock_file")
             elapsed=\$((\$NOW - \$block_time))
             if [ "\$elapsed" -ge "\$unlock_sec" ]; then
-                while iptables -D INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null; do :; done
-                while iptables -D INPUT -p udp --dport "\$port" -j DROP 2>/dev/null; do :; done
+                while iptables -D TG_BLOCK -p tcp --dport "\$port" -j DROP 2>/dev/null; do :; done
+                while iptables -D TG_BLOCK -p udp --dport "\$port" -j DROP 2>/dev/null; do :; done
                 rm -f "\$lock_file"
                 log "INFO: Port \$port UNBLOCKED."
             fi
@@ -269,8 +257,8 @@ if [ -f "\$CONF_PORT" ]; then
         if [ "\$total_bytes" -ge "\$limit_bytes" ]; then
             echo "\$NOW" > "\$lock_file"
             if [ "\$port" != "\$SAFE_SSH_PORT" ]; then
-                iptables -I INPUT 4 -p tcp --dport "\$port" -j DROP
-                iptables -I INPUT 4 -p udp --dport "\$port" -j DROP
+                iptables -I TG_BLOCK 1 -p tcp --dport "\$port" -j DROP
+                iptables -I TG_BLOCK 1 -p udp --dport "\$port" -j DROP
                 log "ALERT: Port \$port BLOCKED (Traffic Limit)."
             fi
         fi
@@ -286,9 +274,8 @@ show_status() {
     clear
     echo -e "${CYAN}========= 全局与网卡流量 (已剔除内网数据) =========${RESET}"
     if [ -f "$INSTALL_PATH" ]; then
-        bash "$INSTALL_PATH" >/dev/null 2>&1 # 强制刷新一次计数器
+        bash "$INSTALL_PATH" >/dev/null 2>&1
         
-        # 抓取全局
         v4_in=$(iptables -L G_IN -v -n -x 2>/dev/null | grep "Global_Ext_In" | awk '{print $2}')
         v4_out=$(iptables -L G_OUT -v -n -x 2>/dev/null | grep "Global_Ext_Out" | awk '{print $2}')
         g_bytes=$((${v4_in:-0} + ${v4_out:-0}))
@@ -323,18 +310,16 @@ show_status() {
     printf "| %-8s | %-14s | %-14s | %-8s | %-12s |\n" " PORT" " USED" " LIMIT" " USAGE" " STATUS"
     echo "$SEP"
     
-    # 动态抓取底层防火墙中所有已挂载的端口流量计数链
-    active_chains=$(iptables -S 2>/dev/null | grep -E '^-N T_IN_[0-9]+' | awk -F'_' '{print $3}' | sort -n)
+    active_chains=$(iptables -S TG_ACCT_IN 2>/dev/null | grep -E ' -j T_IN_[0-9]+$' | awk -F'_' '{print $3}' | sort -n | uniq)
 
     has_data=0
     port_total_bytes=0
 
     for port in $active_chains; do
-        v4_i=$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="T_IN_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
-        v4_o=$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="T_OUT_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
+        v4_i=$(iptables -L T_IN_$port -v -n -x 2>/dev/null | awk '{sum+=$2} END {printf "%.0f", sum}')
+        v4_o=$(iptables -L T_OUT_$port -v -n -x 2>/dev/null | awk '{sum+=$2} END {printf "%.0f", sum}')
         bytes=$((${v4_i:-0} + ${v4_o:-0}))
 
-        # 过滤掉完全0流量的幽灵端口
         if [ "$bytes" -eq 0 ]; then continue; fi
         has_data=1
         port_total_bytes=$((port_total_bytes + bytes))
@@ -347,13 +332,10 @@ show_status() {
             unit="MB"
         fi
 
-        # 匹配配置规则
         limit_gb="0"
         if [ -f "$CONFIG_PORT" ]; then
             conf_line=$(grep -E "^${port}:" "$CONFIG_PORT" | head -n 1)
-            if [ -n "$conf_line" ]; then
-                limit_gb=$(echo "$conf_line" | cut -d: -f2)
-            fi
+            if [ -n "$conf_line" ]; then limit_gb=$(echo "$conf_line" | cut -d: -f2); fi
         fi
 
         limit_bytes=$(echo "$limit_gb * 1024 * 1024 * 1024" | bc | cut -d. -f1)
@@ -365,7 +347,6 @@ show_status() {
             limit_txt="Unlimited"
         fi
 
-        # 状态显示
         if [ -f "$LOCK_DIR/port_$port.lock" ]; then
             s_txt="BLOCKED"
             color_code="${RED}"
@@ -382,10 +363,8 @@ show_status() {
         echo "$SEP"
     done
 
-    # ================= 智能补齐差值 =================
-    # 计算全局流量与所有监听端口总流量的差值（即系统出站、ICMP、盲区扫描噪音）
     misc_bytes=$((g_bytes - port_total_bytes))
-    if [ "$misc_bytes" -gt 104857 ]; then # 超过 0.1MB 才显示，避免微小误差干扰
+    if [ "$misc_bytes" -gt 104857 ]; then
         if [ "$misc_bytes" -gt 1073741824 ]; then
             misc_h=$(awk -v b="$misc_bytes" 'BEGIN {printf "%.2f", b/1073741824}')
             m_unit="GB"
@@ -441,59 +420,49 @@ service_install() {
     check_dependencies
     create_monitor_script
     
-    # 兜底创建缓存目录，防止部分强依赖该目录的系统组件抽风
     mkdir -p /root/.cache
-    
-    # 改用系统级 cron 配置，比 crontab 管道写入更稳如老狗
     echo "* * * * * root bash $INSTALL_PATH >/dev/null 2>&1" > /etc/cron.d/traffic_guard
     chmod 644 /etc/cron.d/traffic_guard
-    
-    # 兼容重启 cron 服务
     systemctl restart cron >/dev/null 2>&1 || systemctl restart crond >/dev/null 2>&1
     
     bash "$INSTALL_PATH"
-    echo -e "${GREEN}守护进程与内外网分流环境安装/重载成功！${RESET}"
+    echo -e "${GREEN}守护进程与底层核心架构安装/重载成功！${RESET}"
 }
 
 service_uninstall() {
-    # 优先清理系统级 cron，同时兼容清理可能残留的用户级旧规则
     rm -f /etc/cron.d/traffic_guard
     crontab -l 2>/dev/null | grep -v "$INSTALL_PATH" | crontab - 2>/dev/null
     
     rm -f "$INSTALL_PATH" "$CONFIG_PORT" "$CONFIG_GLOBAL" "$LOG_FILE"
     rm -rf "$LOCK_DIR"
     
-    # 清理iptables链
-    iptables -D INPUT -i "$DEFAULT_IFACE" -j G_IN 2>/dev/null
-    iptables -F G_IN 2>/dev/null && iptables -X G_IN 2>/dev/null
-    iptables -D OUTPUT -o "$DEFAULT_IFACE" -j G_OUT 2>/dev/null
-    iptables -F G_OUT 2>/dev/null && iptables -X G_OUT 2>/dev/null
-    
-    ip6tables -D INPUT -i "$DEFAULT_IFACE" -j G_IN 2>/dev/null
-    ip6tables -F G_IN 2>/dev/null && ip6tables -X G_IN 2>/dev/null
-    ip6tables -D OUTPUT -o "$DEFAULT_IFACE" -j G_OUT 2>/dev/null
-    ip6tables -F G_OUT 2>/dev/null && ip6tables -X G_OUT 2>/dev/null
-    
-    # 清理所有端口审计链
-    active_chains=$(iptables -S 2>/dev/null | grep -E '^-N T_IN_[0-9]+' | awk -F'_' '{print $3}' | sort -n)
-    for port in $active_chains; do
-        iptables -D INPUT -p tcp --dport "$port" -j "T_IN_$port" 2>/dev/null
-        iptables -D INPUT -p udp --dport "$port" -j "T_IN_$port" 2>/dev/null
-        iptables -F "T_IN_$port" 2>/dev/null && iptables -X "T_IN_$port" 2>/dev/null
+    # 彻底拆除所有架构链
+    for cmd in iptables ip6tables; do
+        \$cmd -D INPUT -j TG_ACCT_IN 2>/dev/null
+        \$cmd -D INPUT -j TG_BLOCK 2>/dev/null
+        \$cmd -D INPUT -j TG_SAFE 2>/dev/null
+        \$cmd -D OUTPUT -j TG_ACCT_OUT 2>/dev/null
         
-        iptables -D OUTPUT -p tcp --sport "$port" -j "T_OUT_$port" 2>/dev/null
-        iptables -D OUTPUT -p udp --sport "$port" -j "T_OUT_$port" 2>/dev/null
-        iptables -F "T_OUT_$port" 2>/dev/null && iptables -X "T_OUT_$port" 2>/dev/null
+        # 清空链内容并删除
+        for chain in TG_ACCT_IN TG_ACCT_OUT TG_BLOCK TG_SAFE G_IN G_OUT; do
+            \$cmd -F \$chain 2>/dev/null && \$cmd -X \$chain 2>/dev/null
+        done
+        
+        # 清理所有端口动态链
+        local chains=\$(\$cmd -S 2>/dev/null | grep -E '^-N T_(IN|OUT)_[0-9]+' | awk '{print \$2}')
+        for chain in \$chains; do
+            \$cmd -F \$chain 2>/dev/null && \$cmd -X \$chain 2>/dev/null
+        done
     done
     
-    echo -e "${GREEN}卸载与清理完成！${RESET}"
+    echo -e "${GREEN}卸载与清理完成！系统防火墙已恢复原样。${RESET}"
 }
 
 # ================== 主菜单 ==================
 while true; do
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}             VPS 流量监控与全网管家 4.5                     ${RESET}"
+    echo -e "${CYAN}             VPS 流量监控与全网管家 5.0                     ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}系统环境 :${RESET} ${WHITE}${SYS_PRETTY_NAME}${RESET}"
     echo -e " ${BLUE}出海网卡 :${RESET} ${WHITE}${DEFAULT_IFACE} ${YELLOW}(自动嗅探并隔离内网)${RESET}"
