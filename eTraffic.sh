@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v4.1 Ultimate
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v4.0 Ultimate
 # 融合极致排版UI、全局网卡监控与内外网流量智能分离
 # ==============================================================
 
@@ -49,25 +49,53 @@ PUBLIC_IPV4=$(curl -s4 --max-time 3 ifconfig.me || curl -s4 --max-time 3 api.ipi
 pause_and_return() { echo ""; read -n 1 -s -r -p ">>> 按任意键返回主菜单..."; }
 
 check_dependencies() {
-    if [ -f /etc/redhat-release ]; then CMD="yum install -y"; else CMD="apt-get install -y"; fi
-    for pkg in bc iptables ip6tables nano net-tools cronie iproute2 jq; do
-        if ! command -v $pkg &> /dev/null; then 
-            echo -e "${YELLOW}正在安装必要依赖: $pkg${RESET}"
-            $CMD $pkg >/dev/null 2>&1
+    local missing_pkgs=""
+
+    # 区分不同系统的包管理器和部分包名差异
+    if [ -f /etc/redhat-release ]; then 
+        CMD="yum install -y"
+        CRON_PKG="cronie"
+    else 
+        CMD="apt-get -y install"
+        CRON_PKG="cron"
+    fi
+
+    # 精准检测具体命令对应的包是否缺失
+    ! command -v bc &> /dev/null && missing_pkgs+=" bc"
+    ! command -v iptables &> /dev/null && missing_pkgs+=" iptables"
+    ! command -v nano &> /dev/null && missing_pkgs+=" nano"
+    ! command -v netstat &> /dev/null && missing_pkgs+=" net-tools"
+    ! command -v crontab &> /dev/null && missing_pkgs+=" $CRON_PKG"
+    ! command -v ip &> /dev/null && missing_pkgs+=" iproute2"
+    ! command -v jq &> /dev/null && missing_pkgs+=" jq"
+
+    # 如果存在缺失的包，则一次性静默安装
+    if [ -n "$missing_pkgs" ]; then
+        echo -e "${YELLOW}--> 正在集中安装缺失的依赖: ${missing_pkgs}${RESET}"
+        if [[ "$CMD" == *"apt-get"* ]]; then
+            apt-get update >/dev/null 2>&1
         fi
-    done
+        $CMD $missing_pkgs >/dev/null 2>&1
+    fi
+
+    # 确保计划任务服务自启并运行
     systemctl enable crond >/dev/null 2>&1 || systemctl enable cron >/dev/null 2>&1
     systemctl start crond >/dev/null 2>&1 || systemctl start cron >/dev/null 2>&1
 }
 
 # ================== 核心守护进程生成引擎 ==================
 create_monitor_script() {
-    # 1. 获取 SSH 端口 (作为绝对白名单防御)
-    SSH_PORT=$(netstat -tnlp 2>/dev/null | grep sshd | awk '{print $4}' | awk -F: '{print $NF}' | head -n 1 | tr -d '[:space:]')
-    [ -z "$SSH_PORT" ] && SSH_PORT=22
+    # 1. 自动提取真实的 SSH 端口 (作为绝对白名单防御，防止把自己锁死)
+    SSH_PORT=$(sshd -T 2>/dev/null | grep -i "^port " | head -n 1 | awk '{print $2}' | tr -d '\r\n')
+    if [[ -z "$SSH_PORT" || ! "$SSH_PORT" =~ ^[0-9]+$ ]]; then
+        SSH_PORT=$(grep -iE "^Port\s+[0-9]+" /etc/ssh/sshd_config | head -n 1 | awk '{print $2}' | tr -d '\r\n')
+    fi
+    [[ -z "$SSH_PORT" || ! "$SSH_PORT" =~ ^[0-9]+$ ]] && SSH_PORT=22
     
     # 2. 获取本机公网 IP (用于解决 Hairpin NAT 问题)
     MY_IP=$(curl -s4 ifconfig.me | tr -d '[:space:]')
+    
+    # ... 下面的 cat > "$INSTALL_PATH" << EOF 保持不变 ...
     
     cat > "$INSTALL_PATH" << EOF
 #!/bin/bash
@@ -239,7 +267,7 @@ EOF
 # ================== 界面：实时看板 ==================
 show_status() {
     clear
-    echo -e "${CYAN}========= 全局与网卡流量 (已剔除内网数据) =========${RESET}"
+    echo -e "${CYAN}================= [3] 全局与网卡流量 (已剔除内网数据) =================${RESET}"
     if [ -f "$INSTALL_PATH" ]; then
         bash "$INSTALL_PATH" >/dev/null 2>&1 # 强制刷新一次计数器
         
@@ -272,7 +300,7 @@ show_status() {
     fi
 
     echo ""
-    echo -e "${CYAN}========= 端口级实时审计 (包含入站/出站) =========${RESET}"
+    echo -e "${CYAN}=================== 端口级实时审计 (包含入站/出站) ===================${RESET}"
     SEP="+----------+----------------+----------------+----------+------------+"
     echo "$SEP"
     printf "| %-8s | %-14s | %-14s | %-8s | %-10s |\n" " PORT" " USED" " LIMIT" " USAGE" " STATUS"
@@ -320,9 +348,9 @@ show_status() {
 # ================== 界面：配置管理 ==================
 menu_global_config() {
     clear
-    echo -e "${CYAN}============= [1] 全局出海流量限额配置 =============${RESET}"
+    echo -e "${CYAN}===================== [1] 全局出海流量限额配置 =====================${RESET}"
     echo -e "${YELLOW}说明：只统计公网流量，自动屏蔽内网IP，到达限额后将阻断外部连接（保留SSH）${RESET}"
-    echo -e "${MAGENTA}------------------------------------------------------${RESET}"
+    echo -e "${MAGENTA}----------------------------------------------------------------------${RESET}"
     read -p "请输入整机每月公网流量上限 (单位:GB, 输入0为不限制): " g_limit
     if [[ "$g_limit" =~ ^[0-9]+$ ]]; then
         echo "GLOBAL_LIMIT_GB=$g_limit" > "$CONFIG_GLOBAL"
@@ -334,9 +362,9 @@ menu_global_config() {
 
 menu_port_config() {
     clear
-    echo -e "${CYAN}============= [2] 独立端口控制规则 =============${RESET}"
+    echo -e "${CYAN}===================== [2] 独立端口控制规则 =====================${RESET}"
     echo -e "${YELLOW}格式示例: 8080:500:10m (端口8080 限额500G 超额封锁10分钟后解封)${RESET}"
-    echo -e "${MAGENTA}--------------------------------------------------${RESET}"
+    echo -e "${MAGENTA}------------------------------------------------------------------${RESET}"
     touch "$CONFIG_PORT"
     while true; do
         echo -e "${BLUE}>> 请输入规则 (直接回车结束并保存):${RESET}"
@@ -393,7 +421,7 @@ service_uninstall() {
 while true; do
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}             VPS 流量监控与全网管家 4.1                     ${RESET}"
+    echo -e "${CYAN}             VPS 流量监控与全网管家 4.0                     ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}系统环境 :${RESET} ${WHITE}${SYS_PRETTY_NAME}${RESET}"
     echo -e " ${BLUE}出海网卡 :${RESET} ${WHITE}${DEFAULT_IFACE} ${YELLOW}(自动嗅探并隔离内网)${RESET}"
