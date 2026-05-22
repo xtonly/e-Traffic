@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v4.0 Ultimate
-# 融合极致排版UI、全局网卡监控与内外网流量智能分离
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v4.5 Ultimate
+# 融合极致排版UI、全局网卡监控、内外网分离与全自动端口嗅探审计
 # ==============================================================
 
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -95,8 +95,6 @@ create_monitor_script() {
     # 2. 获取本机公网 IP (用于解决 Hairpin NAT 问题)
     MY_IP=$(curl -s4 ifconfig.me | tr -d '[:space:]')
     
-    # ... 下面的 cat > "$INSTALL_PATH" << EOF 保持不变 ...
-    
     cat > "$INSTALL_PATH" << EOF
 #!/bin/bash
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -186,10 +184,31 @@ get_port_bytes() {
     echo \$((\${v4_i:-0} + \${v4_o:-0}))
 }
 
+# --- 自动发现并注册活跃端口 ---
+auto_register_ports() {
+    # 自动抓取所有处于 LISTEN 状态的 TCP/UDP 服务端口 (规避了随机高端口的噪音)
+    local active_ports=\$(ss -tuln | awk 'NR>1 {print \$5}' | awk -F: '{print \$NF}' | grep -E '^[0-9]+\$' | sort -nu)
+    for p in \$active_ports; do
+        init_port_chain "\$p"
+    done
+    
+    # 确保配置文件里设定的端口即使当前没运行，也保持监控链
+    if [ -f "\$CONF_PORT" ]; then
+        while read -r line; do
+            [[ -z "\$line" || "\$line" =~ ^#.*\$ ]] && continue
+            local conf_p=\$(echo "\$line" | cut -d: -f1)
+            if echo "\$conf_p" | grep -qE '^[0-9]+\$'; then
+                init_port_chain "\$conf_p"
+            fi
+        done < "\$CONF_PORT"
+    fi
+}
+
 # ================= 主循环逻辑 =================
 NOW=\$(date +%s)
 setup_foundation
 setup_global_accounting
+auto_register_ports
 
 # 1. 检查全局限额
 if [ -f "\$CONF_GLOBAL" ]; then
@@ -202,7 +221,6 @@ if [ -f "\$CONF_GLOBAL" ]; then
         if [ "\$cur_bytes" -ge "\$gb_bytes" ]; then
             if [ ! -f "\$lock_file" ]; then
                 touch "\$lock_file"
-                # 全局封禁：在建立连接和本地回环后，阻断所有外网新请求（保留SSH）
                 iptables -I INPUT 4 -i "\$MAIN_IFACE" -p tcp ! --dport "\$SAFE_SSH_PORT" -m comment --comment "GLOBAL_BLOCK" -j DROP
                 iptables -I INPUT 4 -i "\$MAIN_IFACE" -p udp -m comment --comment "GLOBAL_BLOCK" -j DROP
                 log "CRITICAL: Global traffic limit reached! External access blocked."
@@ -218,14 +236,13 @@ if [ -f "\$CONF_GLOBAL" ]; then
     fi
 fi
 
-# 2. 检查端口级限额
+# 2. 检查端口级限额 (只对配置了规则的端口执行封锁)
 if [ -f "\$CONF_PORT" ]; then
     while read -r line; do
-        [[ -z "\$line" || "\$line" =~ ^#.*$ ]] && continue
+        [[ -z "\$line" || "\$line" =~ ^#.*\$ ]] && continue
         IFS=':' read -r port limit_gb raw_time <<< "\$line"
-        if ! echo "\$port" | grep -qE '^[0-9]+$'; then continue; fi
+        if ! echo "\$port" | grep -qE '^[0-9]+\$'; then continue; fi
 
-        init_port_chain "\$port"
         lock_file="\$LOCK_DIR/port_\$port.lock"
         
         if [[ "\$raw_time" == *"m"* ]]; then
@@ -238,8 +255,8 @@ if [ -f "\$CONF_PORT" ]; then
             block_time=\$(cat "\$lock_file")
             elapsed=\$((\$NOW - \$block_time))
             if [ "\$elapsed" -ge "\$unlock_sec" ]; then
-                # 解封
                 while iptables -D INPUT -p tcp --dport "\$port" -j DROP 2>/dev/null; do :; done
+                while iptables -D INPUT -p udp --dport "\$port" -j DROP 2>/dev/null; do :; done
                 rm -f "\$lock_file"
                 log "INFO: Port \$port UNBLOCKED."
             fi
@@ -267,7 +284,7 @@ EOF
 # ================== 界面：实时看板 ==================
 show_status() {
     clear
-    echo -e "${CYAN}================= [3] 全局与网卡流量 (已剔除内网数据) =================${RESET}"
+    echo -e "${CYAN}========= 全局与网卡流量 (已剔除内网数据) =========${RESET}"
     if [ -f "$INSTALL_PATH" ]; then
         bash "$INSTALL_PATH" >/dev/null 2>&1 # 强制刷新一次计数器
         
@@ -300,47 +317,70 @@ show_status() {
     fi
 
     echo ""
-    echo -e "${CYAN}=================== 端口级实时审计 (包含入站/出站) ===================${RESET}"
+    echo -e "${CYAN}========= 端口级实时审计 (包含入站/出站) =========${RESET}"
     SEP="+----------+----------------+----------------+----------+------------+"
     echo "$SEP"
     printf "| %-8s | %-14s | %-14s | %-8s | %-10s |\n" " PORT" " USED" " LIMIT" " USAGE" " STATUS"
     echo "$SEP"
     
-    if [ -f "$CONFIG_PORT" ]; then
-        while read -r line; do
-            [[ -z "$line" || "$line" =~ ^#.*$ ]] && continue
-            IFS=':' read -r port limit_gb raw_time <<< "$line"
-            if ! echo "$port" | grep -qE '^[0-9]+$'; then continue; fi
+    # 动态抓取底层防火墙中所有已挂载的端口流量计数链
+    active_chains=$(iptables -S 2>/dev/null | grep -E '^-N T_IN_[0-9]+' | awk -F'_' '{print $3}' | sort -n)
 
-            v4_i=$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="T_IN_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
-            v4_o=$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="T_OUT_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
-            bytes=$((${v4_i:-0} + ${v4_o:-0}))
+    has_data=0
+    for port in $active_chains; do
+        v4_i=$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="T_IN_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
+        v4_o=$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="T_OUT_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
+        bytes=$((${v4_i:-0} + ${v4_o:-0}))
 
-            if [ "$bytes" -gt 1073741824 ]; then
-                used_h=$(echo "scale=2; $bytes/1024/1024/1024" | bc)
-                unit="GB"
-            else
-                used_h=$(echo "scale=2; $bytes/1024/1024" | bc)
-                unit="MB"
+        # 过滤掉完全0流量的幽灵端口，保持看板清爽
+        if [ "$bytes" -eq 0 ]; then continue; fi
+        has_data=1
+
+        if [ "$bytes" -gt 1073741824 ]; then
+            used_h=$(echo "scale=2; $bytes/1024/1024/1024" | bc)
+            unit="GB"
+        else
+            used_h=$(echo "scale=2; $bytes/1024/1024" | bc)
+            unit="MB"
+        fi
+
+        # 尝试从用户配置文件中匹配该端口是否有特定限额规则
+        limit_gb="0"
+        if [ -f "$CONFIG_PORT" ]; then
+            conf_line=$(grep -E "^${port}:" "$CONFIG_PORT" | head -n 1)
+            if [ -n "$conf_line" ]; then
+                limit_gb=$(echo "$conf_line" | cut -d: -f2)
             fi
+        fi
 
-            limit_bytes=$(echo "$limit_gb * 1024 * 1024 * 1024" | bc | cut -d. -f1)
-            if [ "$limit_bytes" -gt 0 ]; then percent=$(echo "scale=1; ($bytes * 100) / $limit_bytes" | bc); else percent="0"; fi
+        limit_bytes=$(echo "$limit_gb * 1024 * 1024 * 1024" | bc | cut -d. -f1)
+        if [ "$limit_bytes" -gt 0 ]; then 
+            percent=$(echo "scale=1; ($bytes * 100) / $limit_bytes" | bc)
+            limit_txt="${limit_gb} GB"
+        else 
+            percent="-"
+            limit_txt="无限制"
+        fi
 
-            if [ -f "$LOCK_DIR/port_$port.lock" ]; then
-                s_txt="BLOCKED"
-                color_code="${RED}"
-            else
-                s_txt="ACTIVE"
-                color_code="${GREEN}"
-            fi
-            
-            printf "| %-8s | %-14s | %-14s | %-8s | %b%-10s%b |\n" \
-                " $port" " $used_h $unit" " ${limit_gb} GB" " $percent%" "$color_code" " $s_txt" "${RESET}"
-            echo "$SEP"
-        done < "$CONFIG_PORT"
-    else
-        printf "| %-60s |\n" " 未配置任何端口监控规则"
+        # 智能状态显示
+        if [ -f "$LOCK_DIR/port_$port.lock" ]; then
+            s_txt="已熔断阻断"
+            color_code="${RED}"
+        elif [ "$limit_bytes" -gt 0 ]; then
+            s_txt="监控&限流"
+            color_code="${YELLOW}"
+        else
+            s_txt="仅统计"
+            color_code="${GREEN}"
+        fi
+        
+        printf "| %-8s | %-14s | %-14s | %-8s | %b%-10s%b |\n" \
+            " $port" " $used_h $unit" " $limit_txt" " $percent%" "$color_code" " $s_txt" "${RESET}"
+        echo "$SEP"
+    done
+
+    if [ "$has_data" -eq 0 ]; then
+        printf "| %-60s |\n" " 系统暂无产生实质流量的活跃端口"
         echo "$SEP"
     fi
 }
@@ -348,9 +388,9 @@ show_status() {
 # ================== 界面：配置管理 ==================
 menu_global_config() {
     clear
-    echo -e "${CYAN}===================== [1] 全局出海流量限额配置 =====================${RESET}"
+    echo -e "${CYAN}============= [1] 全局出海流量限额配置 =============${RESET}"
     echo -e "${YELLOW}说明：只统计公网流量，自动屏蔽内网IP，到达限额后将阻断外部连接（保留SSH）${RESET}"
-    echo -e "${MAGENTA}----------------------------------------------------------------------${RESET}"
+    echo -e "${MAGENTA}------------------------------------------------------${RESET}"
     read -p "请输入整机每月公网流量上限 (单位:GB, 输入0为不限制): " g_limit
     if [[ "$g_limit" =~ ^[0-9]+$ ]]; then
         echo "GLOBAL_LIMIT_GB=$g_limit" > "$CONFIG_GLOBAL"
@@ -362,9 +402,9 @@ menu_global_config() {
 
 menu_port_config() {
     clear
-    echo -e "${CYAN}===================== [2] 独立端口控制规则 =====================${RESET}"
+    echo -e "${CYAN}============= [2] 独立端口控制规则 =============${RESET}"
     echo -e "${YELLOW}格式示例: 8080:500:10m (端口8080 限额500G 超额封锁10分钟后解封)${RESET}"
-    echo -e "${MAGENTA}------------------------------------------------------------------${RESET}"
+    echo -e "${MAGENTA}--------------------------------------------------${RESET}"
     touch "$CONFIG_PORT"
     while true; do
         echo -e "${BLUE}>> 请输入规则 (直接回车结束并保存):${RESET}"
@@ -381,10 +421,10 @@ service_install() {
     check_dependencies
     create_monitor_script
     
-    # [修复点 1] 兜底创建缓存目录，防止部分强依赖该目录的系统组件抽风
+    # 兜底创建缓存目录，防止部分强依赖该目录的系统组件抽风
     mkdir -p /root/.cache
     
-    # [修复点 2] 改用系统级 cron 配置，比 crontab 管道写入更稳如老狗
+    # 改用系统级 cron 配置，比 crontab 管道写入更稳如老狗
     echo "* * * * * root bash $INSTALL_PATH >/dev/null 2>&1" > /etc/cron.d/traffic_guard
     chmod 644 /etc/cron.d/traffic_guard
     
@@ -414,6 +454,18 @@ service_uninstall() {
     ip6tables -D OUTPUT -o "$DEFAULT_IFACE" -j G_OUT 2>/dev/null
     ip6tables -F G_OUT 2>/dev/null && ip6tables -X G_OUT 2>/dev/null
     
+    # 清理所有端口审计链
+    active_chains=$(iptables -S 2>/dev/null | grep -E '^-N T_IN_[0-9]+' | awk -F'_' '{print $3}' | sort -n)
+    for port in $active_chains; do
+        iptables -D INPUT -p tcp --dport "$port" -j "T_IN_$port" 2>/dev/null
+        iptables -D INPUT -p udp --dport "$port" -j "T_IN_$port" 2>/dev/null
+        iptables -F "T_IN_$port" 2>/dev/null && iptables -X "T_IN_$port" 2>/dev/null
+        
+        iptables -D OUTPUT -p tcp --sport "$port" -j "T_OUT_$port" 2>/dev/null
+        iptables -D OUTPUT -p udp --sport "$port" -j "T_OUT_$port" 2>/dev/null
+        iptables -F "T_OUT_$port" 2>/dev/null && iptables -X "T_OUT_$port" 2>/dev/null
+    done
+    
     echo -e "${GREEN}卸载与清理完成！${RESET}"
 }
 
@@ -421,7 +473,7 @@ service_uninstall() {
 while true; do
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}             VPS 流量监控与全网管家 4.0                     ${RESET}"
+    echo -e "${CYAN}             VPS 流量监控与全网管家 4.5                     ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}系统环境 :${RESET} ${WHITE}${SYS_PRETTY_NAME}${RESET}"
     echo -e " ${BLUE}出海网卡 :${RESET} ${WHITE}${DEFAULT_IFACE} ${YELLOW}(自动嗅探并隔离内网)${RESET}"
