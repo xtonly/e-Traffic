@@ -318,9 +318,11 @@ show_status() {
 
     echo ""
     echo -e "${CYAN}========= 端口级实时审计 (包含入站/出站) =========${RESET}"
-    SEP="+----------+----------------+----------------+----------+------------+"
+    # [修复点]: 最后一列分隔符延长了2个字符，总宽度匹配对齐
+    SEP="+----------+----------------+----------------+----------+--------------+"
     echo "$SEP"
-    printf "| %-8s | %-14s | %-14s | %-8s | %-10s |\n" " PORT" " USED" " LIMIT" " USAGE" " STATUS"
+    # [修复点]: 最后一列格式从 %-10s 调整为 %-12s
+    printf "| %-8s | %-14s | %-14s | %-8s | %-12s |\n" " PORT" " USED" " LIMIT" " USAGE" " STATUS"
     echo "$SEP"
     
     # 动态抓取底层防火墙中所有已挂载的端口流量计数链
@@ -362,7 +364,7 @@ show_status() {
             limit_txt="Unlimited"
         fi
 
-        # 智能状态显示 (全面英文，保证 printf 像素级对齐)
+        # 智能状态显示
         if [ -f "$LOCK_DIR/port_$port.lock" ]; then
             s_txt="BLOCKED"
             color_code="${RED}"
@@ -374,13 +376,15 @@ show_status() {
             color_code="${GREEN}"
         fi
         
-        printf "| %-8s | %-14s | %-14s | %-8s | %b%-10s%b |\n" \
+        # [修复点]: 最后一列格式从 %-10s 调整为 %-12s
+        printf "| %-8s | %-14s | %-14s | %-8s | %b%-12s%b |\n" \
             " $port" " $used_h $unit" " $limit_txt" " $percent%" "$color_code" " $s_txt" "${RESET}"
         echo "$SEP"
     done
 
     if [ "$has_data" -eq 0 ]; then
-        printf "| %-60s |\n" " 系统暂无产生实质流量的活跃端口"
+        # [修复点]: 空白提示行宽度匹配最新的表格总宽度 68
+        printf "| %-68s |\n" " 系统暂无产生实质流量的活跃端口"
         echo "$SEP"
     fi
 }
