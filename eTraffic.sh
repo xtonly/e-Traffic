@@ -352,22 +352,40 @@ menu_port_config() {
 service_install() {
     check_dependencies
     create_monitor_script
-    if ! crontab -l 2>/dev/null | grep -q "$INSTALL_PATH"; then
-        (crontab -l 2>/dev/null; echo "* * * * * $INSTALL_PATH >/dev/null 2>&1") | crontab -
-    fi
+    
+    # [修复点 1] 兜底创建缓存目录，防止部分强依赖该目录的系统组件抽风
+    mkdir -p /root/.cache
+    
+    # [修复点 2] 改用系统级 cron 配置，比 crontab 管道写入更稳如老狗
+    echo "* * * * * root bash $INSTALL_PATH >/dev/null 2>&1" > /etc/cron.d/traffic_guard
+    chmod 644 /etc/cron.d/traffic_guard
+    
+    # 兼容重启 cron 服务
+    systemctl restart cron >/dev/null 2>&1 || systemctl restart crond >/dev/null 2>&1
+    
     bash "$INSTALL_PATH"
     echo -e "${GREEN}守护进程与内外网分流环境安装/重载成功！${RESET}"
 }
 
 service_uninstall() {
-    crontab -l 2>/dev/null | grep -v "$INSTALL_PATH" | crontab -
+    # 优先清理系统级 cron，同时兼容清理可能残留的用户级旧规则
+    rm -f /etc/cron.d/traffic_guard
+    crontab -l 2>/dev/null | grep -v "$INSTALL_PATH" | crontab - 2>/dev/null
+    
     rm -f "$INSTALL_PATH" "$CONFIG_PORT" "$CONFIG_GLOBAL" "$LOG_FILE"
     rm -rf "$LOCK_DIR"
+    
     # 清理iptables链
     iptables -D INPUT -i "$DEFAULT_IFACE" -j G_IN 2>/dev/null
     iptables -F G_IN 2>/dev/null && iptables -X G_IN 2>/dev/null
     iptables -D OUTPUT -o "$DEFAULT_IFACE" -j G_OUT 2>/dev/null
     iptables -F G_OUT 2>/dev/null && iptables -X G_OUT 2>/dev/null
+    
+    ip6tables -D INPUT -i "$DEFAULT_IFACE" -j G_IN 2>/dev/null
+    ip6tables -F G_IN 2>/dev/null && ip6tables -X G_IN 2>/dev/null
+    ip6tables -D OUTPUT -o "$DEFAULT_IFACE" -j G_OUT 2>/dev/null
+    ip6tables -F G_OUT 2>/dev/null && ip6tables -X G_OUT 2>/dev/null
+    
     echo -e "${GREEN}卸载与清理完成！${RESET}"
 }
 
@@ -375,7 +393,7 @@ service_uninstall() {
 while true; do
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}             VPS 流量监控与全网管家 4.0                     ${RESET}"
+    echo -e "${CYAN}             VPS 流量监控与全网管家 4.1                     ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}系统环境 :${RESET} ${WHITE}${SYS_PRETTY_NAME}${RESET}"
     echo -e " ${BLUE}出海网卡 :${RESET} ${WHITE}${DEFAULT_IFACE} ${YELLOW}(自动嗅探并隔离内网)${RESET}"
