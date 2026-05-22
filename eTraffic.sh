@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v5.0 Ultimate
-# 融合极致排版UI、全局网卡监控、内外网分离与绝对底层记账链架构
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v5.1 Ultimate
+# 融合极致排版UI、全局监控、内外网分离、IPv6双栈抓取与Docker转发链全覆盖
 # ==============================================================
 
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -100,21 +100,27 @@ MAIN_IFACE="$DEFAULT_IFACE"
 mkdir -p "\$LOCK_DIR"
 log() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG_FILE"; }
 
-# --- 终极核心：重构防火墙链架构 ---
+# --- 终极核心：IPv4/IPv6双栈防漏拦截链架构 ---
 setup_foundation() {
     for cmd in iptables ip6tables; do
-        # 创建我们私有的三层处理链
         \$cmd -N TG_ACCT_IN 2>/dev/null
         \$cmd -N TG_ACCT_OUT 2>/dev/null
         \$cmd -N TG_BLOCK 2>/dev/null
         \$cmd -N TG_SAFE 2>/dev/null
         
-        # 严格按照从上到下的顺序挂载：记账(第一) -> 阻断(第二) -> 白名单(第三)
+        # 挂载到 INPUT 链 (宿主机流量)
         if ! \$cmd -C INPUT -j TG_SAFE 2>/dev/null; then \$cmd -I INPUT 1 -j TG_SAFE; fi
         if ! \$cmd -C INPUT -j TG_BLOCK 2>/dev/null; then \$cmd -I INPUT 1 -j TG_BLOCK; fi
         if ! \$cmd -C INPUT -j TG_ACCT_IN 2>/dev/null; then \$cmd -I INPUT 1 -j TG_ACCT_IN; fi
         
+        # 挂载到 OUTPUT 链 (宿主机发出)
         if ! \$cmd -C OUTPUT -j TG_ACCT_OUT 2>/dev/null; then \$cmd -I OUTPUT 1 -j TG_ACCT_OUT; fi
+
+        # 挂载到 FORWARD 链 (Docker/透明代理转发核心区域)
+        if ! \$cmd -C FORWARD -j TG_SAFE 2>/dev/null; then \$cmd -I FORWARD 1 -j TG_SAFE; fi
+        if ! \$cmd -C FORWARD -j TG_BLOCK 2>/dev/null; then \$cmd -I FORWARD 1 -j TG_BLOCK; fi
+        if ! \$cmd -C FORWARD -j TG_ACCT_IN 2>/dev/null; then \$cmd -I FORWARD 1 -j TG_ACCT_IN; fi
+        if ! \$cmd -C FORWARD -j TG_ACCT_OUT 2>/dev/null; then \$cmd -I FORWARD 1 -j TG_ACCT_OUT; fi
 
         # 填充防断流与防自锁白名单
         if ! \$cmd -C TG_SAFE -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; then
@@ -138,17 +144,14 @@ setup_global_accounting() {
         \$cmd -N G_IN 2>/dev/null
         \$cmd -N G_OUT 2>/dev/null
         
-        # 将流量计挂载到记账主链
         \$cmd -C TG_ACCT_IN -i "\$MAIN_IFACE" -j G_IN 2>/dev/null || \$cmd -A TG_ACCT_IN -i "\$MAIN_IFACE" -j G_IN
         \$cmd -C TG_ACCT_OUT -o "\$MAIN_IFACE" -j G_OUT 2>/dev/null || \$cmd -A TG_ACCT_OUT -o "\$MAIN_IFACE" -j G_OUT
         
-        # 剔除内网网段
         for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 fc00::/7 fe80::/10; do
             \$cmd -C G_IN -s \$net -j RETURN 2>/dev/null || \$cmd -A G_IN -s \$net -j RETURN 2>/dev/null
             \$cmd -C G_OUT -d \$net -j RETURN 2>/dev/null || \$cmd -A G_OUT -d \$net -j RETURN 2>/dev/null
         done
         
-        # 挂上注释签，方便统计
         \$cmd -C G_IN -m comment --comment "Global_Ext_In" -j RETURN 2>/dev/null || \$cmd -A G_IN -m comment --comment "Global_Ext_In" -j RETURN
         \$cmd -C G_OUT -m comment --comment "Global_Ext_Out" -j RETURN 2>/dev/null || \$cmd -A G_OUT -m comment --comment "Global_Ext_Out" -j RETURN
     done
@@ -156,15 +159,16 @@ setup_global_accounting() {
 
 init_port_chain() {
     local port=\$1
-    iptables -N "T_IN_\$port" 2>/dev/null
-    iptables -N "T_OUT_\$port" 2>/dev/null
-    
-    # 将端口计费挂载到记账主链
-    iptables -C TG_ACCT_IN -p tcp --dport "\$port" -j "T_IN_\$port" 2>/dev/null || iptables -A TG_ACCT_IN -p tcp --dport "\$port" -j "T_IN_\$port"
-    iptables -C TG_ACCT_IN -p udp --dport "\$port" -j "T_IN_\$port" 2>/dev/null || iptables -A TG_ACCT_IN -p udp --dport "\$port" -j "T_IN_\$port"
-    
-    iptables -C TG_ACCT_OUT -p tcp --sport "\$port" -j "T_OUT_\$port" 2>/dev/null || iptables -A TG_ACCT_OUT -p tcp --sport "\$port" -j "T_OUT_\$port"
-    iptables -C TG_ACCT_OUT -p udp --sport "\$port" -j "T_OUT_\$port" 2>/dev/null || iptables -A TG_ACCT_OUT -p udp --sport "\$port" -j "T_OUT_\$port"
+    for cmd in iptables ip6tables; do
+        \$cmd -N "T_IN_\$port" 2>/dev/null
+        \$cmd -N "T_OUT_\$port" 2>/dev/null
+        
+        \$cmd -C TG_ACCT_IN -p tcp --dport "\$port" -j "T_IN_\$port" 2>/dev/null || \$cmd -A TG_ACCT_IN -p tcp --dport "\$port" -j "T_IN_\$port"
+        \$cmd -C TG_ACCT_IN -p udp --dport "\$port" -j "T_IN_\$port" 2>/dev/null || \$cmd -A TG_ACCT_IN -p udp --dport "\$port" -j "T_IN_\$port"
+        
+        \$cmd -C TG_ACCT_OUT -p tcp --sport "\$port" -j "T_OUT_\$port" 2>/dev/null || \$cmd -A TG_ACCT_OUT -p tcp --sport "\$port" -j "T_OUT_\$port"
+        \$cmd -C TG_ACCT_OUT -p udp --sport "\$port" -j "T_OUT_\$port" 2>/dev/null || \$cmd -A TG_ACCT_OUT -p udp --sport "\$port" -j "T_OUT_\$port"
+    done
 }
 
 get_global_bytes() {
@@ -179,7 +183,9 @@ get_port_bytes() {
     local p=\$1
     local v4_i=\$(iptables -L T_IN_\$p -v -n -x 2>/dev/null | awk '{sum+=\$2} END {printf "%.0f", sum}')
     local v4_o=\$(iptables -L T_OUT_\$p -v -n -x 2>/dev/null | awk '{sum+=\$2} END {printf "%.0f", sum}')
-    echo \$((\${v4_i:-0} + \${v4_o:-0}))
+    local v6_i=\$(ip6tables -L T_IN_\$p -v -n -x 2>/dev/null | awk '{sum+=\$2} END {printf "%.0f", sum}')
+    local v6_o=\$(ip6tables -L T_OUT_\$p -v -n -x 2>/dev/null | awk '{sum+=\$2} END {printf "%.0f", sum}')
+    echo \$((\${v4_i:-0} + \${v4_o:-0} + \${v6_i:-0} + \${v6_o:-0}))
 }
 
 auto_register_ports() {
@@ -209,16 +215,19 @@ if [ -f "\$CONF_GLOBAL" ]; then
         if [ "\$cur_bytes" -ge "\$gb_bytes" ]; then
             if [ ! -f "\$lock_file" ]; then
                 touch "\$lock_file"
-                # 在阻断层执行拦截
-                iptables -I TG_BLOCK 1 -i "\$MAIN_IFACE" -p tcp ! --dport "\$SAFE_SSH_PORT" -m comment --comment "GLOBAL_BLOCK" -j DROP
-                iptables -I TG_BLOCK 1 -i "\$MAIN_IFACE" -p udp -m comment --comment "GLOBAL_BLOCK" -j DROP
+                for cmd in iptables ip6tables; do
+                    \$cmd -I TG_BLOCK 1 -i "\$MAIN_IFACE" -p tcp ! --dport "\$SAFE_SSH_PORT" -m comment --comment "GLOBAL_BLOCK" -j DROP
+                    \$cmd -I TG_BLOCK 1 -i "\$MAIN_IFACE" -p udp -m comment --comment "GLOBAL_BLOCK" -j DROP
+                done
                 log "CRITICAL: Global traffic limit reached! External access blocked."
             fi
         else
             if [ -f "\$lock_file" ]; then
                 rm -f "\$lock_file"
-                while iptables -D TG_BLOCK -i "\$MAIN_IFACE" -p tcp ! --dport "\$SAFE_SSH_PORT" -m comment --comment "GLOBAL_BLOCK" -j DROP 2>/dev/null; do :; done
-                while iptables -D TG_BLOCK -i "\$MAIN_IFACE" -p udp -m comment --comment "GLOBAL_BLOCK" -j DROP 2>/dev/null; do :; done
+                for cmd in iptables ip6tables; do
+                    while \$cmd -D TG_BLOCK -i "\$MAIN_IFACE" -p tcp ! --dport "\$SAFE_SSH_PORT" -m comment --comment "GLOBAL_BLOCK" -j DROP 2>/dev/null; do :; done
+                    while \$cmd -D TG_BLOCK -i "\$MAIN_IFACE" -p udp -m comment --comment "GLOBAL_BLOCK" -j DROP 2>/dev/null; do :; done
+                done
                 log "INFO: Global traffic lock released."
             fi
         fi
@@ -243,8 +252,10 @@ if [ -f "\$CONF_PORT" ]; then
             block_time=\$(cat "\$lock_file")
             elapsed=\$((\$NOW - \$block_time))
             if [ "\$elapsed" -ge "\$unlock_sec" ]; then
-                while iptables -D TG_BLOCK -p tcp --dport "\$port" -j DROP 2>/dev/null; do :; done
-                while iptables -D TG_BLOCK -p udp --dport "\$port" -j DROP 2>/dev/null; do :; done
+                for cmd in iptables ip6tables; do
+                    while \$cmd -D TG_BLOCK -p tcp --dport "\$port" -j DROP 2>/dev/null; do :; done
+                    while \$cmd -D TG_BLOCK -p udp --dport "\$port" -j DROP 2>/dev/null; do :; done
+                done
                 rm -f "\$lock_file"
                 log "INFO: Port \$port UNBLOCKED."
             fi
@@ -257,8 +268,10 @@ if [ -f "\$CONF_PORT" ]; then
         if [ "\$total_bytes" -ge "\$limit_bytes" ]; then
             echo "\$NOW" > "\$lock_file"
             if [ "\$port" != "\$SAFE_SSH_PORT" ]; then
-                iptables -I TG_BLOCK 1 -p tcp --dport "\$port" -j DROP
-                iptables -I TG_BLOCK 1 -p udp --dport "\$port" -j DROP
+                for cmd in iptables ip6tables; do
+                    \$cmd -I TG_BLOCK 1 -p tcp --dport "\$port" -j DROP
+                    \$cmd -I TG_BLOCK 1 -p udp --dport "\$port" -j DROP
+                done
                 log "ALERT: Port \$port BLOCKED (Traffic Limit)."
             fi
         fi
@@ -278,7 +291,9 @@ show_status() {
         
         v4_in=$(iptables -L G_IN -v -n -x 2>/dev/null | grep "Global_Ext_In" | awk '{print $2}')
         v4_out=$(iptables -L G_OUT -v -n -x 2>/dev/null | grep "Global_Ext_Out" | awk '{print $2}')
-        g_bytes=$((${v4_in:-0} + ${v4_out:-0}))
+        v6_in=$(ip6tables -L G_IN -v -n -x 2>/dev/null | grep "Global_Ext_In" | awk '{print $2}')
+        v6_out=$(ip6tables -L G_OUT -v -n -x 2>/dev/null | grep "Global_Ext_Out" | awk '{print $2}')
+        g_bytes=$((${v4_in:-0} + ${v4_out:-0} + ${v6_in:-0} + ${v6_out:-0}))
         
         if [ "$g_bytes" -gt 1073741824 ]; then
             g_used=$(awk -v b="$g_bytes" 'BEGIN {printf "%.2f", b/1073741824}')
@@ -310,7 +325,8 @@ show_status() {
     printf "| %-8s | %-14s | %-14s | %-8s | %-12s |\n" " PORT" " USED" " LIMIT" " USAGE" " STATUS"
     echo "$SEP"
     
-    active_chains=$(iptables -S TG_ACCT_IN 2>/dev/null | grep -E ' -j T_IN_[0-9]+$' | awk -F'_' '{print $3}' | sort -n | uniq)
+    # 获取所有的计数链 (包括 IPv4 和 IPv6)
+    active_chains=$( (iptables -S TG_ACCT_IN 2>/dev/null; ip6tables -S TG_ACCT_IN 2>/dev/null) | grep -E ' -j T_IN_[0-9]+$' | awk -F'_' '{print $3}' | sort -n | uniq)
 
     has_data=0
     port_total_bytes=0
@@ -318,7 +334,9 @@ show_status() {
     for port in $active_chains; do
         v4_i=$(iptables -L T_IN_$port -v -n -x 2>/dev/null | awk '{sum+=$2} END {printf "%.0f", sum}')
         v4_o=$(iptables -L T_OUT_$port -v -n -x 2>/dev/null | awk '{sum+=$2} END {printf "%.0f", sum}')
-        bytes=$((${v4_i:-0} + ${v4_o:-0}))
+        v6_i=$(ip6tables -L T_IN_$port -v -n -x 2>/dev/null | awk '{sum+=$2} END {printf "%.0f", sum}')
+        v6_o=$(ip6tables -L T_OUT_$port -v -n -x 2>/dev/null | awk '{sum+=$2} END {printf "%.0f", sum}')
+        bytes=$((${v4_i:-0} + ${v4_o:-0} + ${v6_i:-0} + ${v6_o:-0}))
 
         if [ "$bytes" -eq 0 ]; then continue; fi
         has_data=1
@@ -436,12 +454,18 @@ service_uninstall() {
     rm -f "$INSTALL_PATH" "$CONFIG_PORT" "$CONFIG_GLOBAL" "$LOG_FILE"
     rm -rf "$LOCK_DIR"
     
-    # 彻底拆除所有架构链
+    # 彻底拆除所有双栈架构链
     for cmd in iptables ip6tables; do
         $cmd -D INPUT -j TG_ACCT_IN 2>/dev/null
         $cmd -D INPUT -j TG_BLOCK 2>/dev/null
         $cmd -D INPUT -j TG_SAFE 2>/dev/null
+        
         $cmd -D OUTPUT -j TG_ACCT_OUT 2>/dev/null
+        
+        $cmd -D FORWARD -j TG_ACCT_IN 2>/dev/null
+        $cmd -D FORWARD -j TG_BLOCK 2>/dev/null
+        $cmd -D FORWARD -j TG_SAFE 2>/dev/null
+        $cmd -D FORWARD -j TG_ACCT_OUT 2>/dev/null
         
         # 清空链内容并删除
         for chain in TG_ACCT_IN TG_ACCT_OUT TG_BLOCK TG_SAFE G_IN G_OUT; do
@@ -462,10 +486,10 @@ service_uninstall() {
 while true; do
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}             VPS 流量监控与全网管家 5.0                     ${RESET}"
+    echo -e "${CYAN}             VPS 流量监控与全网管家 5.1                     ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}系统环境 :${RESET} ${WHITE}${SYS_PRETTY_NAME}${RESET}"
-    echo -e " ${BLUE}出海网卡 :${RESET} ${WHITE}${DEFAULT_IFACE} ${YELLOW}(自动嗅探并隔离内网)${RESET}"
+    echo -e " ${BLUE}出海网卡 :${RESET} ${WHITE}${DEFAULT_IFACE} ${YELLOW}(双栈全覆盖/隔离内网)${RESET}"
     echo -e " ${BLUE}公网 IPv4:${RESET} ${GREEN}${PUBLIC_IPV4}${RESET}"
     echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
     echo -e "  ${YELLOW}1.${RESET} 全局流量管理 (设置网卡出海总上限)"
