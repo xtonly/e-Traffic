@@ -318,10 +318,8 @@ show_status() {
 
     echo ""
     echo -e "${CYAN}========= 端口级实时审计 (包含入站/出站) =========${RESET}"
-    # [修复点]: 最后一列分隔符延长了2个字符，总宽度匹配对齐
     SEP="+----------+----------------+----------------+----------+--------------+"
     echo "$SEP"
-    # [修复点]: 最后一列格式从 %-10s 调整为 %-12s
     printf "| %-8s | %-14s | %-14s | %-8s | %-12s |\n" " PORT" " USED" " LIMIT" " USAGE" " STATUS"
     echo "$SEP"
     
@@ -329,14 +327,17 @@ show_status() {
     active_chains=$(iptables -S 2>/dev/null | grep -E '^-N T_IN_[0-9]+' | awk -F'_' '{print $3}' | sort -n)
 
     has_data=0
+    port_total_bytes=0
+
     for port in $active_chains; do
         v4_i=$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v t="T_IN_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
         v4_o=$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v t="T_OUT_$port" '$3 == t {sum+=$2} END {printf "%.0f", sum}')
         bytes=$((${v4_i:-0} + ${v4_o:-0}))
 
-        # 过滤掉完全0流量的幽灵端口，保持看板清爽
+        # 过滤掉完全0流量的幽灵端口
         if [ "$bytes" -eq 0 ]; then continue; fi
         has_data=1
+        port_total_bytes=$((port_total_bytes + bytes))
 
         if [ "$bytes" -gt 1073741824 ]; then
             used_h=$(awk -v b="$bytes" 'BEGIN {printf "%.2f", b/1073741824}')
@@ -346,7 +347,7 @@ show_status() {
             unit="MB"
         fi
 
-        # 尝试从用户配置文件中匹配该端口是否有特定限额规则
+        # 匹配配置规则
         limit_gb="0"
         if [ -f "$CONFIG_PORT" ]; then
             conf_line=$(grep -E "^${port}:" "$CONFIG_PORT" | head -n 1)
@@ -364,7 +365,7 @@ show_status() {
             limit_txt="Unlimited"
         fi
 
-        # 智能状态显示
+        # 状态显示
         if [ -f "$LOCK_DIR/port_$port.lock" ]; then
             s_txt="BLOCKED"
             color_code="${RED}"
@@ -376,14 +377,29 @@ show_status() {
             color_code="${GREEN}"
         fi
         
-        # [修复点]: 最后一列格式从 %-10s 调整为 %-12s
         printf "| %-8s | %-14s | %-14s | %-8s | %b%-12s%b |\n" \
             " $port" " $used_h $unit" " $limit_txt" " $percent%" "$color_code" " $s_txt" "${RESET}"
         echo "$SEP"
     done
 
+    # ================= 智能补齐差值 =================
+    # 计算全局流量与所有监听端口总流量的差值（即系统出站、ICMP、盲区扫描噪音）
+    misc_bytes=$((g_bytes - port_total_bytes))
+    if [ "$misc_bytes" -gt 104857 ]; then # 超过 0.1MB 才显示，避免微小误差干扰
+        if [ "$misc_bytes" -gt 1073741824 ]; then
+            misc_h=$(awk -v b="$misc_bytes" 'BEGIN {printf "%.2f", b/1073741824}')
+            m_unit="GB"
+        else
+            misc_h=$(awk -v b="$misc_bytes" 'BEGIN {printf "%.2f", b/1048576}')
+            m_unit="MB"
+        fi
+        printf "| %-8s | %-14s | %-14s | %-8s | %b%-12s%b |\n" \
+            " System" " $misc_h $m_unit" " Unlimited" " -%" "${WHITE}" " Background" "${RESET}"
+        echo "$SEP"
+        has_data=1
+    fi
+
     if [ "$has_data" -eq 0 ]; then
-        # [修复点]: 空白提示行宽度匹配最新的表格总宽度 68
         printf "| %-68s |\n" " 系统暂无产生实质流量的活跃端口"
         echo "$SEP"
     fi
