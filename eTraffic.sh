@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v5.6 Final
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v5.5
 # 终极修复：废除清空逻辑解决计数清零问题，原子级链创建，极简双栈拦截
 # ==============================================================
 
@@ -323,7 +323,7 @@ show_status() {
         else echo $(($in_b + $out_b)); fi
     }
 
-    echo -e "${CYAN}============== [1] 全局与网卡流量 (已剔除内网数据) ==============${RESET}"
+    echo -e "${CYAN}================== [3] 全局与网卡流量 (已剔除内网数据) ==================${RESET}"
     if [ -f "$INSTALL_PATH" ]; then
         bash "$INSTALL_PATH" >/dev/null 2>&1
         
@@ -361,7 +361,7 @@ show_status() {
     fi
 
     echo ""
-    echo -e "${CYAN}============== 端口级实时审计 (Mangle 底层穿透) ===============${RESET}"
+    echo -e "${CYAN}=================== 端口级实时审计 (Mangle 底层穿透) ====================${RESET}"
     SEP="+----------+----------------+----------------+----------+--------------+"
     echo "$SEP"
     printf "| %-8s | %-14s | %-14s | %-8s | %-12s |\n" " PORT" " USED" " LIMIT" " USAGE" " STATUS"
@@ -474,9 +474,9 @@ menu_global_config() {
 
 menu_port_config() {
     clear
-    echo -e "${CYAN}==================== [2] 独立端口控制规则 ====================${RESET}"
+    echo -e "${CYAN}====================== [2] 独立端口控制规则 ======================${RESET}"
     echo -e "${YELLOW}格式示例: 8080:500:10m (端口8080 限额500G 超额封锁10分钟后解封)${RESET}"
-    echo -e "${MAGENTA}--------------------------------------------------------------${RESET}"
+    echo -e "${MAGENTA}------------------------------------------------------------------${RESET}"
     touch "$CONFIG_PORT"
     while true; do
         echo -e "${BLUE}>> 请输入规则 (直接回车结束并保存):${RESET}"
@@ -534,7 +534,7 @@ service_uninstall() {
 while true; do
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}               VPS 流量监控与全网管家 5.6                   ${RESET}"
+    echo -e "${CYAN}               VPS 流量监控与全网管家 5.5                     ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}系统环境 :${RESET} ${WHITE}${SYS_PRETTY_NAME}${RESET}"
     echo -e " ${BLUE}出海网卡 :${RESET} ${WHITE}${DEFAULT_IFACE} ${YELLOW}(原子级防丢数据机制)${RESET}"
