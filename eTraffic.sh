@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v5.6 Final
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v5.6
 # 终极修复：废除清空逻辑解决计数清零问题，原子级链创建，极简双栈拦截
 # ==============================================================
 
@@ -323,7 +323,7 @@ show_status() {
         else echo $(($in_b + $out_b)); fi
     }
 
-    echo -e "${CYAN}========= 全局与网卡流量 (已剔除内网数据) =========${RESET}"
+    echo -e "${CYAN}============== [1] 全局与网卡流量 (已剔除内网数据) ==============${RESET}"
     if [ -f "$INSTALL_PATH" ]; then
         bash "$INSTALL_PATH" >/dev/null 2>&1
         
@@ -361,7 +361,7 @@ show_status() {
     fi
 
     echo ""
-    echo -e "${CYAN}========= 端口级实时审计 (Mangle 底层穿透) =========${RESET}"
+    echo -e "${CYAN}============== 端口级实时审计 (Mangle 底层穿透) ===============${RESET}"
     SEP="+----------+----------------+----------------+----------+--------------+"
     echo "$SEP"
     printf "| %-8s | %-14s | %-14s | %-8s | %-12s |\n" " PORT" " USED" " LIMIT" " USAGE" " STATUS"
@@ -449,9 +449,9 @@ show_status() {
 # ================== 界面：配置管理 ==================
 menu_global_config() {
     clear
-    echo -e "${CYAN}============= [1] 全局与计费模式配置 =============${RESET}"
+    echo -e "${CYAN}================== [1] 全局与计费模式配置 ==================${RESET}"
     echo -e "${YELLOW}说明：支持三大主流云厂商计费模式，自动同步应用于全局和端口统计${RESET}"
-    echo -e "${MAGENTA}--------------------------------------------------${RESET}"
+    echo -e "${MAGENTA}------------------------------------------------------------${RESET}"
     
     echo -e "${BLUE}请选择服务器计费模式：${RESET}"
     echo " 1. 双向合计 (入站 + 出站，默认标准)"
@@ -462,7 +462,7 @@ menu_global_config() {
     echo "T_MODE=$t_mode" > "$CONFIG_MODE"
     echo -e "${GREEN}计费模式已保存！${RESET}"
     
-    echo -e "${MAGENTA}--------------------------------------------------${RESET}"
+    echo -e "${MAGENTA}------------------------------------------------------------${RESET}"
     read -p "请输入整机每月公网流量上限 (单位:GB, 输入0为不限制): " g_limit
     if [[ "$g_limit" =~ ^[0-9]+$ ]]; then
         echo "GLOBAL_LIMIT_GB=$g_limit" > "$CONFIG_GLOBAL"
@@ -474,9 +474,9 @@ menu_global_config() {
 
 menu_port_config() {
     clear
-    echo -e "${CYAN}============= [2] 独立端口控制规则 =============${RESET}"
+    echo -e "${CYAN}================== [2] 独立端口控制规则 ==================${RESET}"
     echo -e "${YELLOW}格式示例: 8080:500:10m (端口8080 限额500G 超额封锁10分钟后解封)${RESET}"
-    echo -e "${MAGENTA}--------------------------------------------------${RESET}"
+    echo -e "${MAGENTA}------------------------------------------------------------${RESET}"
     touch "$CONFIG_PORT"
     while true; do
         echo -e "${BLUE}>> 请输入规则 (直接回车结束并保存):${RESET}"
@@ -534,7 +534,7 @@ service_uninstall() {
 while true; do
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}             VPS 流量监控与全网管家 5.6 Final               ${RESET}"
+    echo -e "${CYAN}                VPS 流量监控与全网管家 5.6                  ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}系统环境 :${RESET} ${WHITE}${SYS_PRETTY_NAME}${RESET}"
     echo -e " ${BLUE}出海网卡 :${RESET} ${WHITE}${DEFAULT_IFACE} ${YELLOW}(原子级防丢数据机制)${RESET}"
@@ -544,7 +544,7 @@ while true; do
     echo -e "  ${YELLOW}2.${RESET} 端口流量管理 (添加/编辑独立监控规则)"
     echo -e "  ${YELLOW}3.${RESET} 实时流量看板 (查看全局与各端口情况)"
     echo -e "  ${YELLOW}4.${RESET} 重载监控服务 (修改配置后请执行此项)"
-    echo -e "  ${YELLOW}5.${RESET} 彻底卸载清理 (清空规则与拦截 - ${RED}必选清理修复${RESET})"
+    echo -e "  ${YELLOW}5.${RESET} 彻底卸载清理 (清空规则与拦截)"
     echo -e "  ${YELLOW}6.${RESET} 查看执行日志 (拦截记录)"
     echo -e "  ${RED}9.${RESET} 修复代理服务 (重启常用 Proxy / 刷新端口占用)"
     echo -e "  ${WHITE}0.${RESET} 退出脚本"
