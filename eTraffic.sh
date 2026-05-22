@@ -438,20 +438,20 @@ service_uninstall() {
     
     # 彻底拆除所有架构链
     for cmd in iptables ip6tables; do
-        \$cmd -D INPUT -j TG_ACCT_IN 2>/dev/null
-        \$cmd -D INPUT -j TG_BLOCK 2>/dev/null
-        \$cmd -D INPUT -j TG_SAFE 2>/dev/null
-        \$cmd -D OUTPUT -j TG_ACCT_OUT 2>/dev/null
+        $cmd -D INPUT -j TG_ACCT_IN 2>/dev/null
+        $cmd -D INPUT -j TG_BLOCK 2>/dev/null
+        $cmd -D INPUT -j TG_SAFE 2>/dev/null
+        $cmd -D OUTPUT -j TG_ACCT_OUT 2>/dev/null
         
         # 清空链内容并删除
         for chain in TG_ACCT_IN TG_ACCT_OUT TG_BLOCK TG_SAFE G_IN G_OUT; do
-            \$cmd -F \$chain 2>/dev/null && \$cmd -X \$chain 2>/dev/null
+            $cmd -F $chain 2>/dev/null && $cmd -X $chain 2>/dev/null
         done
         
         # 清理所有端口动态链
-        local chains=\$(\$cmd -S 2>/dev/null | grep -E '^-N T_(IN|OUT)_[0-9]+' | awk '{print \$2}')
-        for chain in \$chains; do
-            \$cmd -F \$chain 2>/dev/null && \$cmd -X \$chain 2>/dev/null
+        local chains=$($cmd -S 2>/dev/null | grep -E '^-N T_(IN|OUT)_[0-9]+' | awk '{print $2}')
+        for chain in $chains; do
+            $cmd -F $chain 2>/dev/null && $cmd -X $chain 2>/dev/null
         done
     done
     
