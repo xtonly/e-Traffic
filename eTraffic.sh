@@ -294,10 +294,10 @@ show_status() {
         g_bytes=$((${v4_in:-0} + ${v4_out:-0}))
         
         if [ "$g_bytes" -gt 1073741824 ]; then
-            g_used=$(echo "scale=2; $g_bytes/1024/1024/1024" | bc)
+            g_used=$(awk -v b="$g_bytes" 'BEGIN {printf "%.2f", b/1073741824}')
             g_unit="GB"
         else
-            g_used=$(echo "scale=2; $g_bytes/1024/1024" | bc)
+            g_used=$(awk -v b="$g_bytes" 'BEGIN {printf "%.2f", b/1048576}')
             g_unit="MB"
         fi
 
@@ -337,10 +337,10 @@ show_status() {
         has_data=1
 
         if [ "$bytes" -gt 1073741824 ]; then
-            used_h=$(echo "scale=2; $bytes/1024/1024/1024" | bc)
+            used_h=$(awk -v b="$bytes" 'BEGIN {printf "%.2f", b/1073741824}')
             unit="GB"
         else
-            used_h=$(echo "scale=2; $bytes/1024/1024" | bc)
+            used_h=$(awk -v b="$bytes" 'BEGIN {printf "%.2f", b/1048576}')
             unit="MB"
         fi
 
@@ -355,22 +355,22 @@ show_status() {
 
         limit_bytes=$(echo "$limit_gb * 1024 * 1024 * 1024" | bc | cut -d. -f1)
         if [ "$limit_bytes" -gt 0 ]; then 
-            percent=$(echo "scale=1; ($bytes * 100) / $limit_bytes" | bc)
+            percent=$(awk -v b="$bytes" -v l="$limit_bytes" 'BEGIN {printf "%.1f", (b*100)/l}')
             limit_txt="${limit_gb} GB"
         else 
             percent="-"
-            limit_txt="无限制"
+            limit_txt="Unlimited"
         fi
 
-        # 智能状态显示
+        # 智能状态显示 (全面英文，保证 printf 像素级对齐)
         if [ -f "$LOCK_DIR/port_$port.lock" ]; then
-            s_txt="已熔断阻断"
+            s_txt="BLOCKED"
             color_code="${RED}"
         elif [ "$limit_bytes" -gt 0 ]; then
-            s_txt="监控&限流"
+            s_txt="Active"
             color_code="${YELLOW}"
         else
-            s_txt="仅统计"
+            s_txt="Stats Only"
             color_code="${GREEN}"
         fi
         
