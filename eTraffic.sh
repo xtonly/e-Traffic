@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v5.3 Ultimate
-# 修复底层 Mangle 空链统计漏洞，实现精确到字节的端口计费闭环
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v5.5 Final
+# 终极修复：去重、精准提取动态端口、修复Docker穿透、完全闭环
 # ==============================================================
 
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -127,16 +127,13 @@ setup_foundation() {
         \$cmd -t filter -N TG_BLOCK 2>/dev/null
         \$cmd -t filter -N TG_SAFE 2>/dev/null
         if ! \$cmd -t filter -C INPUT -j TG_SAFE 2>/dev/null; then \$cmd -t filter -I INPUT 1 -j TG_SAFE; fi
-        if ! \$cmd -t filter -C INPUT -j TG_BLOCK 2>/dev/null; then \$cmd -t filter -I INPUT 1 -j TG_BLOCK; fi
+        if ! \$cmd -t filter -C INPUT -j TG_BLOCK 2>/dev/null; then \$cmd -t filter -I INPUT 2 -j TG_BLOCK; fi
         if ! \$cmd -t filter -C FORWARD -j TG_SAFE 2>/dev/null; then \$cmd -t filter -I FORWARD 1 -j TG_SAFE; fi
-        if ! \$cmd -t filter -C FORWARD -j TG_BLOCK 2>/dev/null; then \$cmd -t filter -I FORWARD 1 -j TG_BLOCK; fi
+        if ! \$cmd -t filter -C FORWARD -j TG_BLOCK 2>/dev/null; then \$cmd -t filter -I FORWARD 2 -j TG_BLOCK; fi
 
-        if ! \$cmd -t filter -C TG_SAFE -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; then
-            \$cmd -t filter -A TG_SAFE -m state --state ESTABLISHED,RELATED -j ACCEPT
-        fi
-        if ! \$cmd -t filter -C TG_SAFE -i lo -j ACCEPT 2>/dev/null; then
-            \$cmd -t filter -A TG_SAFE -i lo -j ACCEPT
-        fi
+        \$cmd -t filter -F TG_SAFE 2>/dev/null
+        \$cmd -t filter -A TG_SAFE -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+        \$cmd -t filter -A TG_SAFE -i lo -j ACCEPT 2>/dev/null
     done
     
     if [ ! -z "\$SELF_IP" ]; then
@@ -148,32 +145,33 @@ setup_foundation() {
 
 setup_global_accounting() {
     for cmd in iptables ip6tables; do
-        \$cmd -t mangle -N G_IN 2>/dev/null
-        \$cmd -t mangle -N G_OUT 2>/dev/null
+        \$cmd -t mangle -F G_IN 2>/dev/null || \$cmd -t mangle -N G_IN
+        \$cmd -t mangle -F G_OUT 2>/dev/null || \$cmd -t mangle -N G_OUT
         
-        \$cmd -t mangle -C TG_ACCT_IN -i "\$MAIN_IFACE" -j G_IN 2>/dev/null || \$cmd -t mangle -A TG_ACCT_IN -i "\$MAIN_IFACE" -j G_IN
-        \$cmd -t mangle -C TG_ACCT_OUT -o "\$MAIN_IFACE" -j G_OUT 2>/dev/null || \$cmd -t mangle -A TG_ACCT_OUT -o "\$MAIN_IFACE" -j G_OUT
+        \$cmd -t mangle -C TG_ACCT_IN -j G_IN 2>/dev/null || \$cmd -t mangle -A TG_ACCT_IN -j G_IN
+        \$cmd -t mangle -C TG_ACCT_OUT -j G_OUT 2>/dev/null || \$cmd -t mangle -A TG_ACCT_OUT -j G_OUT
         
         for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 fc00::/7 fe80::/10; do
-            \$cmd -t mangle -C G_IN -s \$net -j RETURN 2>/dev/null || \$cmd -t mangle -A G_IN -s \$net -j RETURN 2>/dev/null
-            \$cmd -t mangle -C G_OUT -d \$net -j RETURN 2>/dev/null || \$cmd -t mangle -A G_OUT -d \$net -j RETURN 2>/dev/null
+            \$cmd -t mangle -A G_IN -s \$net -j RETURN 2>/dev/null
+            \$cmd -t mangle -A G_OUT -d \$net -j RETURN 2>/dev/null
         done
         
-        \$cmd -t mangle -C G_IN -m comment --comment "Global_Ext_In" -j RETURN 2>/dev/null || \$cmd -t mangle -A G_IN -m comment --comment "Global_Ext_In" -j RETURN
-        \$cmd -t mangle -C G_OUT -m comment --comment "Global_Ext_Out" -j RETURN 2>/dev/null || \$cmd -t mangle -A G_OUT -m comment --comment "Global_Ext_Out" -j RETURN
+        \$cmd -t mangle -A G_IN -m comment --comment "Global_Ext_In" -j RETURN 2>/dev/null
+        \$cmd -t mangle -A G_OUT -m comment --comment "Global_Ext_Out" -j RETURN 2>/dev/null
     done
 }
 
 init_port_chain() {
     local port=\$1
     for cmd in iptables ip6tables; do
-        \$cmd -t mangle -N "T_IN_\$port" 2>/dev/null
-        \$cmd -t mangle -N "T_OUT_\$port" 2>/dev/null
+        # 强制清理旧链防重复
+        \$cmd -t mangle -F "T_IN_\$port" 2>/dev/null || \$cmd -t mangle -N "T_IN_\$port"
+        \$cmd -t mangle -F "T_OUT_\$port" 2>/dev/null || \$cmd -t mangle -N "T_OUT_\$port"
         
-        # [核心修复]: 注入 RETURN 记账锚点，解决空链导致 awk 读不到行的问题
-        \$cmd -t mangle -C "T_IN_\$port" -j RETURN 2>/dev/null || \$cmd -t mangle -A "T_IN_\$port" -j RETURN
-        \$cmd -t mangle -C "T_OUT_\$port" -j RETURN 2>/dev/null || \$cmd -t mangle -A "T_OUT_\$port" -j RETURN
+        \$cmd -t mangle -A "T_IN_\$port" -j RETURN 2>/dev/null
+        \$cmd -t mangle -A "T_OUT_\$port" -j RETURN 2>/dev/null
         
+        # 直接挂载到总流，不挑网卡，全网通吃
         \$cmd -t mangle -C TG_ACCT_IN -p tcp --dport "\$port" -j "T_IN_\$port" 2>/dev/null || \$cmd -t mangle -A TG_ACCT_IN -p tcp --dport "\$port" -j "T_IN_\$port"
         \$cmd -t mangle -C TG_ACCT_IN -p udp --dport "\$port" -j "T_IN_\$port" 2>/dev/null || \$cmd -t mangle -A TG_ACCT_IN -p udp --dport "\$port" -j "T_IN_\$port"
         
@@ -183,10 +181,10 @@ init_port_chain() {
 }
 
 get_global_bytes() {
-    local v4_in=\$(iptables -t mangle -L G_IN -v -n -x 2>/dev/null | grep "Global_Ext_In" | awk '{print \$2}')
-    local v4_out=\$(iptables -t mangle -L G_OUT -v -n -x 2>/dev/null | grep "Global_Ext_Out" | awk '{print \$2}')
-    local v6_in=\$(ip6tables -t mangle -L G_IN -v -n -x 2>/dev/null | grep "Global_Ext_In" | awk '{print \$2}')
-    local v6_out=\$(ip6tables -t mangle -L G_OUT -v -n -x 2>/dev/null | grep "Global_Ext_Out" | awk '{print \$2}')
+    local v4_in=\$(iptables -t mangle -L G_IN -v -n -x 2>/dev/null | awk '/Global_Ext_In/ {sum+=\$2} END {printf "%.0f", sum}')
+    local v4_out=\$(iptables -t mangle -L G_OUT -v -n -x 2>/dev/null | awk '/Global_Ext_Out/ {sum+=\$2} END {printf "%.0f", sum}')
+    local v6_in=\$(ip6tables -t mangle -L G_IN -v -n -x 2>/dev/null | awk '/Global_Ext_In/ {sum+=\$2} END {printf "%.0f", sum}')
+    local v6_out=\$(ip6tables -t mangle -L G_OUT -v -n -x 2>/dev/null | awk '/Global_Ext_Out/ {sum+=\$2} END {printf "%.0f", sum}')
     local total_in=\$((\${v4_in:-0} + \${v6_in:-0}))
     local total_out=\$((\${v4_out:-0} + \${v6_out:-0}))
     calc_bytes \$total_in \$total_out
@@ -194,7 +192,6 @@ get_global_bytes() {
 
 get_port_bytes() {
     local p=\$1
-    # [核心修复]: 强制只读取第3行（真实数据行），完美过滤表头避免 awk 错误累加
     local v4_i=\$(iptables -t mangle -L T_IN_\$p -v -n -x 2>/dev/null | awk 'NR>2 {sum+=\$2} END {printf "%.0f", sum}')
     local v4_o=\$(iptables -t mangle -L T_OUT_\$p -v -n -x 2>/dev/null | awk 'NR>2 {sum+=\$2} END {printf "%.0f", sum}')
     local v6_i=\$(ip6tables -t mangle -L T_IN_\$p -v -n -x 2>/dev/null | awk 'NR>2 {sum+=\$2} END {printf "%.0f", sum}')
@@ -205,7 +202,8 @@ get_port_bytes() {
 }
 
 auto_register_ports() {
-    local active_ports=\$(ss -tuln | sed -r 's/.*:([0-9]+).*/\1/' | grep -E '^[0-9]+\$' | sort -nu)
+    # 彻底修复了抓取不到代理节点高位端口的正则表达式 Bug
+    local active_ports=\$(ss -tuln | awk 'NR>1 {print \$5}' | awk -F':' '{print \$NF}' | grep -E '^[0-9]+\$' | sort -nu)
     for p in \$active_ports; do init_port_chain "\$p"; done
     if [ -f "\$CONF_PORT" ]; then
         while read -r line; do
@@ -232,8 +230,8 @@ if [ -f "\$CONF_GLOBAL" ]; then
             if [ ! -f "\$lock_file" ]; then
                 touch "\$lock_file"
                 for cmd in iptables ip6tables; do
-                    \$cmd -t filter -I TG_BLOCK 1 -i "\$MAIN_IFACE" -p tcp ! --dport "\$SAFE_SSH_PORT" -m comment --comment "GLOBAL_BLOCK" -j DROP
-                    \$cmd -t filter -I TG_BLOCK 1 -i "\$MAIN_IFACE" -p udp -m comment --comment "GLOBAL_BLOCK" -j DROP
+                    \$cmd -t filter -I TG_BLOCK 1 -p tcp ! --dport "\$SAFE_SSH_PORT" -m comment --comment "GLOBAL_BLOCK" -j DROP
+                    \$cmd -t filter -I TG_BLOCK 1 -p udp -m comment --comment "GLOBAL_BLOCK" -j DROP
                 done
                 log "CRITICAL: Global traffic limit reached! External access blocked."
             fi
@@ -241,8 +239,8 @@ if [ -f "\$CONF_GLOBAL" ]; then
             if [ -f "\$lock_file" ]; then
                 rm -f "\$lock_file"
                 for cmd in iptables ip6tables; do
-                    while \$cmd -t filter -D TG_BLOCK -i "\$MAIN_IFACE" -p tcp ! --dport "\$SAFE_SSH_PORT" -m comment --comment "GLOBAL_BLOCK" -j DROP 2>/dev/null; do :; done
-                    while \$cmd -t filter -D TG_BLOCK -i "\$MAIN_IFACE" -p udp -m comment --comment "GLOBAL_BLOCK" -j DROP 2>/dev/null; do :; done
+                    while \$cmd -t filter -D TG_BLOCK -p tcp ! --dport "\$SAFE_SSH_PORT" -m comment --comment "GLOBAL_BLOCK" -j DROP 2>/dev/null; do :; done
+                    while \$cmd -t filter -D TG_BLOCK -p udp -m comment --comment "GLOBAL_BLOCK" -j DROP 2>/dev/null; do :; done
                 done
                 log "INFO: Global traffic lock released."
             fi
@@ -321,10 +319,10 @@ show_status() {
     if [ -f "$INSTALL_PATH" ]; then
         bash "$INSTALL_PATH" >/dev/null 2>&1
         
-        v4_in=$(iptables -t mangle -L G_IN -v -n -x 2>/dev/null | grep "Global_Ext_In" | awk '{print $2}')
-        v4_out=$(iptables -t mangle -L G_OUT -v -n -x 2>/dev/null | grep "Global_Ext_Out" | awk '{print $2}')
-        v6_in=$(ip6tables -t mangle -L G_IN -v -n -x 2>/dev/null | grep "Global_Ext_In" | awk '{print $2}')
-        v6_out=$(ip6tables -t mangle -L G_OUT -v -n -x 2>/dev/null | grep "Global_Ext_Out" | awk '{print $2}')
+        v4_in=$(iptables -t mangle -L G_IN -v -n -x 2>/dev/null | awk '/Global_Ext_In/ {sum+=$2} END {printf "%.0f", sum}')
+        v4_out=$(iptables -t mangle -L G_OUT -v -n -x 2>/dev/null | awk '/Global_Ext_Out/ {sum+=$2} END {printf "%.0f", sum}')
+        v6_in=$(ip6tables -t mangle -L G_IN -v -n -x 2>/dev/null | awk '/Global_Ext_In/ {sum+=$2} END {printf "%.0f", sum}')
+        v6_out=$(ip6tables -t mangle -L G_OUT -v -n -x 2>/dev/null | awk '/Global_Ext_Out/ {sum+=$2} END {printf "%.0f", sum}')
         
         total_in=$((${v4_in:-0} + ${v6_in:-0}))
         total_out=$((${v4_out:-0} + ${v6_out:-0}))
@@ -344,7 +342,7 @@ show_status() {
             source "$CONFIG_GLOBAL"
             if [ "$GLOBAL_LIMIT_GB" -gt 0 ]; then
                 g_limit="${GLOBAL_LIMIT_GB} GB"
-                if [ -f "$LOCK_DIR/global.lock" ]; then g_status="${RED}全网熔断阻断中${RESET}"; fi
+                if [ -f "$LOCK_DIR/global.lock" ]; then g_status="${RED}全网阻断中${RESET}"; fi
             fi
         fi
         
@@ -361,7 +359,8 @@ show_status() {
     printf "| %-8s | %-14s | %-14s | %-8s | %-12s |\n" " PORT" " USED" " LIMIT" " USAGE" " STATUS"
     echo "$SEP"
     
-    active_chains=$( (iptables -t mangle -S TG_ACCT_IN 2>/dev/null; ip6tables -t mangle -S TG_ACCT_IN 2>/dev/null) | grep -E ' -j T_IN_[0-9]+$' | awk -F'_' '{print $3}' | sort -n | uniq)
+    # 终极修复：使用绝对精准的链名提取正则，杜绝一切重复与缺失
+    active_chains=$( (iptables -t mangle -S 2>/dev/null; ip6tables -t mangle -S 2>/dev/null) | grep -E '^-N T_IN_[0-9]+$' | awk -F'_' '{print $3}' | sort -n | uniq)
 
     has_data=0
     port_total_bytes=0
@@ -420,7 +419,6 @@ show_status() {
     done
 
     misc_bytes=$((g_bytes - port_total_bytes))
-    # 允许负误差（比如清空计数器时的临界点），只展示正的杂项流量
     if [ "$misc_bytes" -gt 104857 ]; then
         if [ "$misc_bytes" -gt 1073741824 ]; then
             misc_h=$(awk -v b="$misc_bytes" 'BEGIN {printf "%.2f", b/1073741824}')
@@ -513,28 +511,24 @@ service_uninstall() {
         $cmd -t filter -D FORWARD -j TG_BLOCK 2>/dev/null
         $cmd -t filter -D FORWARD -j TG_SAFE 2>/dev/null
         
-        for chain in TG_ACCT_IN TG_ACCT_OUT G_IN G_OUT; do
-            $cmd -t mangle -F $chain 2>/dev/null && $cmd -t mangle -X $chain 2>/dev/null
-        done
+        # 终极强力清理手段：找出一切创建过的链并物理抹除，根绝重复！
+        local m_chains=$($cmd -t mangle -S 2>/dev/null | grep -E '^-N (T_IN|T_OUT|G_IN|G_OUT|TG_ACCT_IN|TG_ACCT_OUT)' | awk '{print $2}')
+        for chain in $m_chains; do $cmd -t mangle -F $chain 2>/dev/null; done
+        for chain in $m_chains; do $cmd -t mangle -X $chain 2>/dev/null; done
         
-        for chain in TG_BLOCK TG_SAFE; do
-            $cmd -t filter -F $chain 2>/dev/null && $cmd -t filter -X $chain 2>/dev/null
-        done
-        
-        local chains=$($cmd -t mangle -S 2>/dev/null | grep -E '^-N T_(IN|OUT)_[0-9]+' | awk '{print $2}')
-        for chain in $chains; do
-            $cmd -t mangle -F $chain 2>/dev/null && $cmd -t mangle -X $chain 2>/dev/null
-        done
+        local f_chains=$($cmd -t filter -S 2>/dev/null | grep -E '^-N (TG_BLOCK|TG_SAFE)' | awk '{print $2}')
+        for chain in $f_chains; do $cmd -t filter -F $chain 2>/dev/null; done
+        for chain in $f_chains; do $cmd -t filter -X $chain 2>/dev/null; done
     done
     
-    echo -e "${GREEN}卸载与清理完成！系统防火墙已完全恢复原样。${RESET}"
+    echo -e "${GREEN}卸载与清理完成！底层所有计费链已物理抹除，系统完全复原。${RESET}"
 }
 
 # ================== 主菜单 ==================
 while true; do
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}             VPS 流量监控与全网管家 5.3                     ${RESET}"
+    echo -e "${CYAN}             VPS 流量监控与全网管家 5.5 Final               ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}系统环境 :${RESET} ${WHITE}${SYS_PRETTY_NAME}${RESET}"
     echo -e " ${BLUE}出海网卡 :${RESET} ${WHITE}${DEFAULT_IFACE} ${YELLOW}(Mangle层防Docker穿透)${RESET}"
@@ -544,7 +538,7 @@ while true; do
     echo -e "  ${YELLOW}2.${RESET} 端口流量管理 (添加/编辑独立监控规则)"
     echo -e "  ${YELLOW}3.${RESET} 实时流量看板 (查看全局与各端口情况)"
     echo -e "  ${YELLOW}4.${RESET} 重载监控服务 (修改配置后请执行此项)"
-    echo -e "  ${YELLOW}5.${RESET} 彻底卸载清理 (清空规则与拦截)"
+    echo -e "  ${YELLOW}5.${RESET} 彻底卸载清理 (清空规则与拦截 - ${RED}必选清理修复${RESET})"
     echo -e "  ${YELLOW}6.${RESET} 查看执行日志 (拦截记录)"
     echo -e "  ${RED}9.${RESET} 修复代理服务 (重启常用 Proxy / 刷新端口占用)"
     echo -e "  ${WHITE}0.${RESET} 退出脚本"
