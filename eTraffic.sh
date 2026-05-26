@@ -1,8 +1,8 @@
 #!/bin/bash
-# ==============================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v5.5
-# 终极修复：废除清空逻辑解决计数清零问题，原子级链创建，极简双栈拦截
-# ==============================================================
+# ========================================================================
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v5.5 (Persistent Edition)
+# 终极修复：引入持久化状态账本解决重启/宕机丢数据问题，兼容 UFW/Docker
+# ========================================================================
 
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export DEBIAN_FRONTEND=noninteractive
@@ -24,6 +24,7 @@ CONFIG_GLOBAL="/etc/traffic_guard_global.conf"
 CONFIG_MODE="/etc/traffic_guard_mode.conf"
 LOG_FILE="/var/log/traffic_guard.log"
 LOCK_DIR="/tmp/traffic_guard_locks"
+DATA_DIR="/var/lib/traffic_guard" # 【新增】流量持久化账本目录
 INSTALL_PATH="/usr/local/bin/traffic_guard.sh"
 
 # ================== 环境探测与缓存 ==================
@@ -95,11 +96,12 @@ CONF_GLOBAL="$CONFIG_GLOBAL"
 CONF_MODE="$CONFIG_MODE"
 LOG_FILE="$LOG_FILE"
 LOCK_DIR="$LOCK_DIR"
+DATA_DIR="$DATA_DIR"
 SAFE_SSH_PORT="$SSH_PORT"
 SELF_IP="$MY_IP"
 MAIN_IFACE="$DEFAULT_IFACE"
 
-mkdir -p "\$LOCK_DIR"
+mkdir -p "\$LOCK_DIR" "\$DATA_DIR"
 log() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG_FILE"; }
 
 T_MODE=1
@@ -116,6 +118,30 @@ calc_bytes() {
         echo \$((\$in_b + \$out_b))
     fi
 }
+
+# --- 【新增】持久化状态处理引擎 ---
+handle_persistence() {
+    local id=\$1
+    local cur_in=\$2
+    local cur_out=\$3
+    local file="\$DATA_DIR/\${id}.dat"
+
+    [ ! -f "\$file" ] && echo "0 0 0 0" > "\$file"
+    # p_in/p_out: 持久化的总额; last_in/last_out: 上次内存中的记录
+    read p_in p_out last_in last_out < "\$file"
+
+    # 如果当前 iptables 计数小于上次记录，说明经历了重启，旧数据被冲刷，需加入持久化底账
+    if [ "\$cur_in" -lt "\${last_in:-0}" ]; then p_in=\$((p_in + last_in)); fi
+    if [ "\$cur_out" -lt "\${last_out:-0}" ]; then p_out=\$((p_out + last_out)); fi
+
+    # 更新状态：把当前的内存值作为下一次比对的 "last_in/out"
+    echo "\$p_in \$p_out \$cur_in \$cur_out" > "\$file"
+
+    local final_in=\$((p_in + cur_in))
+    local final_out=\$((p_out + cur_out))
+    echo "\$final_in \$final_out"
+}
+# ----------------------------------
 
 setup_foundation() {
     for cmd in iptables ip6tables; do
@@ -148,7 +174,6 @@ setup_foundation() {
 
 setup_global_accounting() {
     for cmd in iptables ip6tables; do
-        # 绝不使用 -F 刷新链，原子级检测创建，保护计数器永不丢失
         if \$cmd -t mangle -N G_IN 2>/dev/null; then
             \$cmd -t mangle -A TG_ACCT_IN -j G_IN
             for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 fc00::/7 fe80::/10; do
@@ -170,7 +195,6 @@ setup_global_accounting() {
 init_port_chain() {
     local port=\$1
     for cmd in iptables ip6tables; do
-        # 绝不使用 -F 刷新链，原子级检测创建，保护计数器永不丢失
         if \$cmd -t mangle -N "T_IN_\$port" 2>/dev/null; then
             \$cmd -t mangle -A "T_IN_\$port" -j RETURN
             \$cmd -t mangle -A TG_ACCT_IN -p tcp --dport "\$port" -j "T_IN_\$port"
@@ -190,9 +214,15 @@ get_global_bytes() {
     local v4_out=\$(iptables -t mangle -L G_OUT -v -n -x 2>/dev/null | awk '/Global_Ext_Out/ {sum+=\$2} END {printf "%.0f", sum}')
     local v6_in=\$(ip6tables -t mangle -L G_IN -v -n -x 2>/dev/null | awk '/Global_Ext_In/ {sum+=\$2} END {printf "%.0f", sum}')
     local v6_out=\$(ip6tables -t mangle -L G_OUT -v -n -x 2>/dev/null | awk '/Global_Ext_Out/ {sum+=\$2} END {printf "%.0f", sum}')
+    
     local total_in=\$((\${v4_in:-0} + \${v6_in:-0}))
     local total_out=\$((\${v4_out:-0} + \${v6_out:-0}))
-    calc_bytes \$total_in \$total_out
+    
+    local persisted=\$(handle_persistence "global" \$total_in \$total_out)
+    local fin_in=\$(echo \$persisted | awk '{print \$1}')
+    local fin_out=\$(echo \$persisted | awk '{print \$2}')
+    
+    calc_bytes \$fin_in \$fin_out
 }
 
 get_port_bytes() {
@@ -201,9 +231,15 @@ get_port_bytes() {
     local v4_o=\$(iptables -t mangle -L T_OUT_\$p -v -n -x 2>/dev/null | awk 'NR>2 {sum+=\$2} END {printf "%.0f", sum}')
     local v6_i=\$(ip6tables -t mangle -L T_IN_\$p -v -n -x 2>/dev/null | awk 'NR>2 {sum+=\$2} END {printf "%.0f", sum}')
     local v6_o=\$(ip6tables -t mangle -L T_OUT_\$p -v -n -x 2>/dev/null | awk 'NR>2 {sum+=\$2} END {printf "%.0f", sum}')
+    
     local total_in=\$((\${v4_i:-0} + \${v6_i:-0}))
     local total_out=\$((\${v4_o:-0} + \${v6_o:-0}))
-    calc_bytes \$total_in \$total_out
+    
+    local persisted=\$(handle_persistence "port_\$p" \$total_in \$total_out)
+    local fin_in=\$(echo \$persisted | awk '{print \$1}')
+    local fin_out=\$(echo \$persisted | awk '{print \$2}')
+    
+    calc_bytes \$fin_in \$fin_out
 }
 
 auto_register_ports() {
@@ -323,6 +359,25 @@ show_status() {
         else echo $(($in_b + $out_b)); fi
     }
 
+    # --- 【新增】前端只读账本引擎，防止与守护进程抢占文件 ---
+    read_persistence() {
+        local id=$1
+        local cur_in=$2
+        local cur_out=$3
+        local file="$DATA_DIR/${id}.dat"
+
+        local p_in=0 p_out=0 last_in=0 last_out=0
+        if [ -f "$file" ]; then read p_in p_out last_in last_out < "$file"; fi
+
+        if [ "$cur_in" -lt "${last_in:-0}" ]; then p_in=$((p_in + last_in)); fi
+        if [ "$cur_out" -lt "${last_out:-0}" ]; then p_out=$((p_out + last_out)); fi
+
+        local final_in=$((p_in + cur_in))
+        local final_out=$((p_out + cur_out))
+        echo "$final_in $final_out"
+    }
+    # --------------------------------------------------------
+
     echo -e "${CYAN}================== [3] 全局与网卡流量 (已剔除内网数据) ==================${RESET}"
     if [ -f "$INSTALL_PATH" ]; then
         bash "$INSTALL_PATH" >/dev/null 2>&1
@@ -334,7 +389,12 @@ show_status() {
         
         total_in=$((${v4_in:-0} + ${v6_in:-0}))
         total_out=$((${v4_out:-0} + ${v6_out:-0}))
-        g_bytes=$(calc_bytes $total_in $total_out)
+        
+        # 融入持久化计算
+        local persisted=$(read_persistence "global" $total_in $total_out)
+        local fin_in=$(echo $persisted | awk '{print $1}')
+        local fin_out=$(echo $persisted | awk '{print $2}')
+        g_bytes=$(calc_bytes $fin_in $fin_out)
         
         if [ "$g_bytes" -gt 1073741824 ]; then
             g_used=$(awk -v b="$g_bytes" 'BEGIN {printf "%.2f", b/1073741824}')
@@ -379,7 +439,12 @@ show_status() {
         
         p_in=$((${v4_i:-0} + ${v6_i:-0}))
         p_out=$((${v4_o:-0} + ${v6_o:-0}))
-        bytes=$(calc_bytes $p_in $p_out)
+        
+        # 融入持久化计算
+        local p_persisted=$(read_persistence "port_$port" $p_in $p_out)
+        local p_fin_in=$(echo $p_persisted | awk '{print $1}')
+        local p_fin_out=$(echo $p_persisted | awk '{print $2}')
+        bytes=$(calc_bytes $p_fin_in $p_fin_out)
 
         if [ "$bytes" -eq 0 ]; then continue; fi
         has_data=1
@@ -498,7 +563,7 @@ service_install() {
     systemctl restart cron >/dev/null 2>&1 || systemctl restart crond >/dev/null 2>&1
     
     bash "$INSTALL_PATH"
-    echo -e "${GREEN}守护进程与底层 Mangle 架构安装/重载成功！${RESET}"
+    echo -e "${GREEN}守护进程与底层持久化引擎安装/重载成功！${RESET}"
 }
 
 service_uninstall() {
@@ -506,7 +571,7 @@ service_uninstall() {
     crontab -l 2>/dev/null | grep -v "$INSTALL_PATH" | crontab - 2>/dev/null
     
     rm -f "$INSTALL_PATH" "$CONFIG_PORT" "$CONFIG_GLOBAL" "$CONFIG_MODE" "$LOG_FILE"
-    rm -rf "$LOCK_DIR"
+    rm -rf "$LOCK_DIR" "$DATA_DIR"
     
     for cmd in iptables ip6tables; do
         $cmd -t mangle -D PREROUTING -j TG_ACCT_IN 2>/dev/null
@@ -526,14 +591,14 @@ service_uninstall() {
         for chain in $f_chains; do $cmd -t filter -X $chain 2>/dev/null; done
     done
     
-    echo -e "${GREEN}卸载与清理完成！底层所有计费链已物理抹除，系统完全复原。${RESET}"
+    echo -e "${GREEN}卸载与清理完成！底层所有计费链与硬盘持久化文件已物理抹除，系统完全复原。${RESET}"
 }
 
 # ================== 主菜单 ==================
 while true; do
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}               VPS 流量监控与全网管家 5.5                     ${RESET}"
+    echo -e "${CYAN}               VPS 流量监控与全网管家 5.5 (持久化版)          ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}系统环境 :${RESET} ${WHITE}${SYS_PRETTY_NAME}${RESET}"
     echo -e " ${BLUE}出海网卡 :${RESET} ${WHITE}${DEFAULT_IFACE} ${YELLOW}(原子级防丢数据机制)${RESET}"
