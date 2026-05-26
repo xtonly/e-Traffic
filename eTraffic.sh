@@ -1,8 +1,8 @@
 #!/bin/bash
-# ========================================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v5.6 (Lifecycle Edition)
-# 终极修复：持久化账本 + 半路部署校准 + 自动计费周期轮转
-# ========================================================================
+# ==============================================================
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v5.7 (Smart Lifecycle Edition)
+# 终极修复：持久化账本 + 半路部署校准 + 智能计费周期轮转(支持小月月末)
+# ==============================================================
 
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export DEBIAN_FRONTEND=noninteractive
@@ -545,20 +545,16 @@ menu_port_config() {
     done
 }
 
-# --- 【新增】流量校准注入引擎 ---
+# --- 流量校准注入引擎 ---
 menu_calibration() {
     clear
     echo -e "${CYAN}==================== [7] 流量基准校准 (半路部署必备) ====================${RESET}"
-    echo -e "${YELLOW}说明：你的总限额保持 500GB 不变，这里仅向底层账本注入【本月已经用掉的】历史流量。${RESET}"
+    echo -e "${YELLOW}说明：你的总限额保持不变，这里仅向底层账本注入【本月已经用掉的】历史流量。${RESET}"
     echo -e "${MAGENTA}-------------------------------------------------------------------------${RESET}"
     read -p "请输入你需要注入的【已用流量】(单位: GB, 输入0取消): " offset_gb
     if [[ "$offset_gb" =~ ^[0-9]+$ ]] && [ "$offset_gb" -gt 0 ]; then
-        # 统一换算为字节
         offset_bytes=$(echo "$offset_gb * 1024 * 1024 * 1024" | bc | cut -d. -f1)
         mkdir -p "$DATA_DIR"
-        
-        # 安全注入：将历史消耗统一注入到 p_out (出站持久化位)
-        # 格式: p_in p_out last_in last_out
         echo "0 $offset_bytes 0 0" > "$DATA_DIR/global.dat"
         echo -e "${GREEN}校准成功！已成功向账本注入 ${offset_gb} GB 的历史流量占用。${RESET}"
         echo -e "${YELLOW}提示：请选择 [3] 查看看板，你会发现流量已经从 ${offset_gb} GB 开始计算了！${RESET}"
@@ -567,7 +563,7 @@ menu_calibration() {
     fi
 }
 
-# --- 【新增】计费周期轮转引擎 ---
+# --- 智能计费周期轮转引擎 ---
 menu_billing_cycle() {
     clear
     echo -e "${CYAN}====================== [8] 设置自动计费周期 (账单日) ======================${RESET}"
@@ -575,11 +571,16 @@ menu_billing_cycle() {
     echo -e "${MAGENTA}---------------------------------------------------------------------------${RESET}"
     read -p "请输入每月的重置日期 (1-31, 输入0以关闭自动重置): " reset_day
     if [[ "$reset_day" =~ ^[0-9]+$ ]] && [ "$reset_day" -ge 1 ] && [ "$reset_day" -le 31 ]; then
-        # 通过 Cron 定时物理删除持久化数据，守护进程会自动触发自愈解封机制
-        echo "0 0 $reset_day * * root rm -f $DATA_DIR/*.dat >/dev/null 2>&1" > "$CRON_RESET"
+        if [ "$reset_day" == "31" ]; then
+            # 终极修复：如果输入31，改为每天凌晨0点检查明天是不是1号。如果是，说明今天是本月最后一天，执行清零。
+            echo "0 0 * * * root [ \"\$(date +\\%d -d tomorrow)\" = \"01\" ] && rm -f $DATA_DIR/*.dat >/dev/null 2>&1" > "$CRON_RESET"
+            echo -e "${GREEN}设置成功！系统将自动识别每月【最后一天】的凌晨 23:59/次日 00:00 刷新流量周期。${RESET}"
+        else
+            echo "0 0 $reset_day * * root rm -f $DATA_DIR/*.dat >/dev/null 2>&1" > "$CRON_RESET"
+            echo -e "${GREEN}设置成功！每月 ${reset_day} 号凌晨 00:00 将自动刷新流量周期。${RESET}"
+        fi
         chmod 644 "$CRON_RESET"
         systemctl restart cron >/dev/null 2>&1 || systemctl restart crond >/dev/null 2>&1
-        echo -e "${GREEN}设置成功！每月 ${reset_day} 号凌晨 00:00 将自动刷新流量周期。${RESET}"
     elif [ "$reset_day" == "0" ]; then
         rm -f "$CRON_RESET"
         systemctl restart cron >/dev/null 2>&1 || systemctl restart crond >/dev/null 2>&1
@@ -634,15 +635,19 @@ service_uninstall() {
 while true; do
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}           VPS 流量监控管家 5.6 (Lifecycle Edition)          ${RESET}"
+    echo -e "${CYAN}         VPS 流量监控管家 5.7 (Smart Lifecycle Edition)       ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}系统环境 :${RESET} ${WHITE}${SYS_PRETTY_NAME}${RESET}"
     echo -e " ${BLUE}出海网卡 :${RESET} ${WHITE}${DEFAULT_IFACE} ${YELLOW}(底层防丢机制)${RESET}"
     echo -e " ${BLUE}公网 IPv4:${RESET} ${GREEN}${PUBLIC_IPV4}${RESET}"
     
     if [ -f "$CRON_RESET" ]; then
-        b_day=$(awk '{print $3}' "$CRON_RESET" | head -n 1)
-        echo -e " ${BLUE}结算周期 :${RESET} ${GREEN}每月 ${b_day} 号凌晨自动重置清零${RESET}"
+        if grep -q "tomorrow" "$CRON_RESET"; then
+            echo -e " ${BLUE}结算周期 :${RESET} ${GREEN}智能识别每月最后一天自动重置清零${RESET}"
+        else
+            b_day=$(awk '{print $3}' "$CRON_RESET" | head -n 1)
+            echo -e " ${BLUE}结算周期 :${RESET} ${GREEN}每月 ${b_day} 号凌晨自动重置清零${RESET}"
+        fi
     else
         echo -e " ${BLUE}结算周期 :${RESET} ${YELLOW}未设置 (手动重置)${RESET}"
     fi
@@ -651,8 +656,8 @@ while true; do
     echo -e "  ${YELLOW}2.${RESET} 端口流量管理 (添加/编辑独立监控规则)"
     echo -e "  ${YELLOW}3.${RESET} 实时流量看板 (查看全局与各端口情况)"
     echo -e "  ${YELLOW}4.${RESET} 重载监控服务 (修改配置后请执行此项)"
-    echo -e "  ${MAGENTA}7.${RESET} 流量基准校准 (半路部署注入已用流量)  <--【New】"
-    echo -e "  ${MAGENTA}8.${RESET} 设置计费周期 (每月自动归零并解封)    <--【New】"
+    echo -e "  ${MAGENTA}7.${RESET} 流量基准校准 (半路部署注入已用流量)"
+    echo -e "  ${MAGENTA}8.${RESET} 设置计费周期 (每月自动归零并解封)"
     echo -e "  ${YELLOW}9.${RESET} 彻底卸载清理 (清空规则与拦截)"
     echo -e "  ${WHITE}0.${RESET} 退出脚本"
     echo -e "${MAGENTA}=========================================================${RESET}"
