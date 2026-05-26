@@ -635,7 +635,7 @@ service_uninstall() {
 while true; do
     clear
     echo -e "${MAGENTA}==========================================================${RESET}"
-    echo -e "${CYAN}     VPS 流量监控管家 5.7 (Smart Lifecycle Edition)           ${RESET}"
+    echo -e "${CYAN}             VPS 流量监控管家 5.7 (智能版)                     ${RESET}"
     echo -e "${MAGENTA}==========================================================${RESET}"
     echo -e " ${BLUE}系统环境 :${RESET} ${WHITE}${SYS_PRETTY_NAME}${RESET}"
     echo -e " ${BLUE}出海网卡 :${RESET} ${WHITE}${DEFAULT_IFACE} ${YELLOW}(底层防丢机制)${RESET}"
