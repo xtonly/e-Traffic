@@ -1,7 +1,7 @@
 #!/bin/bash
 # ========================================================================
-# VPS 流量自动管理系统 (Traffic Monitor Manager) v5.5 (Persistent Edition)
-# 终极修复：引入持久化状态账本解决重启/宕机丢数据问题，兼容 UFW/Docker
+# VPS 流量自动管理系统 (Traffic Monitor Manager) v5.6 (Lifecycle Edition)
+# 终极修复：持久化账本 + 半路部署校准 + 自动计费周期轮转
 # ========================================================================
 
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -24,8 +24,9 @@ CONFIG_GLOBAL="/etc/traffic_guard_global.conf"
 CONFIG_MODE="/etc/traffic_guard_mode.conf"
 LOG_FILE="/var/log/traffic_guard.log"
 LOCK_DIR="/tmp/traffic_guard_locks"
-DATA_DIR="/var/lib/traffic_guard" # 【新增】流量持久化账本目录
+DATA_DIR="/var/lib/traffic_guard"
 INSTALL_PATH="/usr/local/bin/traffic_guard.sh"
+CRON_RESET="/etc/cron.d/traffic_guard_reset"
 
 # ================== 环境探测与缓存 ==================
 if [[ $EUID -ne 0 ]]; then
@@ -119,7 +120,6 @@ calc_bytes() {
     fi
 }
 
-# --- 【新增】持久化状态处理引擎 ---
 handle_persistence() {
     local id=\$1
     local cur_in=\$2
@@ -127,21 +127,17 @@ handle_persistence() {
     local file="\$DATA_DIR/\${id}.dat"
 
     [ ! -f "\$file" ] && echo "0 0 0 0" > "\$file"
-    # p_in/p_out: 持久化的总额; last_in/last_out: 上次内存中的记录
     read p_in p_out last_in last_out < "\$file"
 
-    # 如果当前 iptables 计数小于上次记录，说明经历了重启，旧数据被冲刷，需加入持久化底账
     if [ "\$cur_in" -lt "\${last_in:-0}" ]; then p_in=\$((p_in + last_in)); fi
     if [ "\$cur_out" -lt "\${last_out:-0}" ]; then p_out=\$((p_out + last_out)); fi
 
-    # 更新状态：把当前的内存值作为下一次比对的 "last_in/out"
     echo "\$p_in \$p_out \$cur_in \$cur_out" > "\$file"
 
     local final_in=\$((p_in + cur_in))
     local final_out=\$((p_out + cur_out))
     echo "\$final_in \$final_out"
 }
-# ----------------------------------
 
 setup_foundation() {
     for cmd in iptables ip6tables; do
@@ -359,7 +355,6 @@ show_status() {
         else echo $(($in_b + $out_b)); fi
     }
 
-    # --- 【新增】前端只读账本引擎，防止与守护进程抢占文件 ---
     read_persistence() {
         local id=$1
         local cur_in=$2
@@ -376,7 +371,6 @@ show_status() {
         local final_out=$((p_out + cur_out))
         echo "$final_in $final_out"
     }
-    # --------------------------------------------------------
 
     echo -e "${CYAN}================== [3] 全局与网卡流量 (已剔除内网数据) ==================${RESET}"
     if [ -f "$INSTALL_PATH" ]; then
@@ -390,7 +384,6 @@ show_status() {
         total_in=$((${v4_in:-0} + ${v6_in:-0}))
         total_out=$((${v4_out:-0} + ${v6_out:-0}))
         
-        # 融入持久化计算
         local persisted=$(read_persistence "global" $total_in $total_out)
         local fin_in=$(echo $persisted | awk '{print $1}')
         local fin_out=$(echo $persisted | awk '{print $2}')
@@ -440,7 +433,6 @@ show_status() {
         p_in=$((${v4_i:-0} + ${v6_i:-0}))
         p_out=$((${v4_o:-0} + ${v6_o:-0}))
         
-        # 融入持久化计算
         local p_persisted=$(read_persistence "port_$port" $p_in $p_out)
         local p_fin_in=$(echo $p_persisted | awk '{print $1}')
         local p_fin_out=$(echo $p_persisted | awk '{print $2}')
@@ -510,7 +502,7 @@ show_status() {
     fi
 }
 
-# ================== 界面：配置管理 ==================
+# ================== 新增：配置管理与高级功能 ==================
 menu_global_config() {
     clear
     echo -e "${CYAN}==================== [1] 全局与计费模式配置 ====================${RESET}"
@@ -553,6 +545,50 @@ menu_port_config() {
     done
 }
 
+# --- 【新增】流量校准注入引擎 ---
+menu_calibration() {
+    clear
+    echo -e "${CYAN}==================== [7] 流量基准校准 (半路部署必备) ====================${RESET}"
+    echo -e "${YELLOW}说明：你的总限额保持 500GB 不变，这里仅向底层账本注入【本月已经用掉的】历史流量。${RESET}"
+    echo -e "${MAGENTA}-------------------------------------------------------------------------${RESET}"
+    read -p "请输入你需要注入的【已用流量】(单位: GB, 输入0取消): " offset_gb
+    if [[ "$offset_gb" =~ ^[0-9]+$ ]] && [ "$offset_gb" -gt 0 ]; then
+        # 统一换算为字节
+        offset_bytes=$(echo "$offset_gb * 1024 * 1024 * 1024" | bc | cut -d. -f1)
+        mkdir -p "$DATA_DIR"
+        
+        # 安全注入：将历史消耗统一注入到 p_out (出站持久化位)
+        # 格式: p_in p_out last_in last_out
+        echo "0 $offset_bytes 0 0" > "$DATA_DIR/global.dat"
+        echo -e "${GREEN}校准成功！已成功向账本注入 ${offset_gb} GB 的历史流量占用。${RESET}"
+        echo -e "${YELLOW}提示：请选择 [3] 查看看板，你会发现流量已经从 ${offset_gb} GB 开始计算了！${RESET}"
+    else
+        echo -e "${RED}已取消或输入无效。${RESET}"
+    fi
+}
+
+# --- 【新增】计费周期轮转引擎 ---
+menu_billing_cycle() {
+    clear
+    echo -e "${CYAN}====================== [8] 设置自动计费周期 (账单日) ======================${RESET}"
+    echo -e "${YELLOW}说明：到达账单日凌晨 00:00，系统会自动清零所有账本，并解除此前的超额封锁。${RESET}"
+    echo -e "${MAGENTA}---------------------------------------------------------------------------${RESET}"
+    read -p "请输入每月的重置日期 (1-31, 输入0以关闭自动重置): " reset_day
+    if [[ "$reset_day" =~ ^[0-9]+$ ]] && [ "$reset_day" -ge 1 ] && [ "$reset_day" -le 31 ]; then
+        # 通过 Cron 定时物理删除持久化数据，守护进程会自动触发自愈解封机制
+        echo "0 0 $reset_day * * root rm -f $DATA_DIR/*.dat >/dev/null 2>&1" > "$CRON_RESET"
+        chmod 644 "$CRON_RESET"
+        systemctl restart cron >/dev/null 2>&1 || systemctl restart crond >/dev/null 2>&1
+        echo -e "${GREEN}设置成功！每月 ${reset_day} 号凌晨 00:00 将自动刷新流量周期。${RESET}"
+    elif [ "$reset_day" == "0" ]; then
+        rm -f "$CRON_RESET"
+        systemctl restart cron >/dev/null 2>&1 || systemctl restart crond >/dev/null 2>&1
+        echo -e "${GREEN}已关闭自动重置周期。${RESET}"
+    else
+        echo -e "${RED}输入无效。${RESET}"
+    fi
+}
+
 service_install() {
     check_dependencies
     create_monitor_script
@@ -567,7 +603,7 @@ service_install() {
 }
 
 service_uninstall() {
-    rm -f /etc/cron.d/traffic_guard
+    rm -f /etc/cron.d/traffic_guard "$CRON_RESET"
     crontab -l 2>/dev/null | grep -v "$INSTALL_PATH" | crontab - 2>/dev/null
     
     rm -f "$INSTALL_PATH" "$CONFIG_PORT" "$CONFIG_GLOBAL" "$CONFIG_MODE" "$LOG_FILE"
@@ -598,19 +634,26 @@ service_uninstall() {
 while true; do
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}         VPS 流量监控与全网管家 5.5 (持久化版)                ${RESET}"
+    echo -e "${CYAN}           VPS 流量监控管家 5.6 (Lifecycle Edition)          ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}系统环境 :${RESET} ${WHITE}${SYS_PRETTY_NAME}${RESET}"
-    echo -e " ${BLUE}出海网卡 :${RESET} ${WHITE}${DEFAULT_IFACE} ${YELLOW}(原子级防丢数据机制)${RESET}"
+    echo -e " ${BLUE}出海网卡 :${RESET} ${WHITE}${DEFAULT_IFACE} ${YELLOW}(底层防丢机制)${RESET}"
     echo -e " ${BLUE}公网 IPv4:${RESET} ${GREEN}${PUBLIC_IPV4}${RESET}"
+    
+    if [ -f "$CRON_RESET" ]; then
+        b_day=$(awk '{print $3}' "$CRON_RESET" | head -n 1)
+        echo -e " ${BLUE}结算周期 :${RESET} ${GREEN}每月 ${b_day} 号凌晨自动重置清零${RESET}"
+    else
+        echo -e " ${BLUE}结算周期 :${RESET} ${YELLOW}未设置 (手动重置)${RESET}"
+    fi
     echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
     echo -e "  ${YELLOW}1.${RESET} 全局流量管理 (设置计费模式与总上限)"
     echo -e "  ${YELLOW}2.${RESET} 端口流量管理 (添加/编辑独立监控规则)"
     echo -e "  ${YELLOW}3.${RESET} 实时流量看板 (查看全局与各端口情况)"
     echo -e "  ${YELLOW}4.${RESET} 重载监控服务 (修改配置后请执行此项)"
-    echo -e "  ${YELLOW}5.${RESET} 彻底卸载清理 (清空规则与拦截)"
-    echo -e "  ${YELLOW}6.${RESET} 查看执行日志 (拦截记录)"
-    echo -e "  ${RED}9.${RESET} 修复代理服务 (重启常用 Proxy / 刷新端口占用)"
+    echo -e "  ${MAGENTA}7.${RESET} 流量基准校准 (半路部署注入已用流量)  <--【New】"
+    echo -e "  ${MAGENTA}8.${RESET} 设置计费周期 (每月自动归零并解封)    <--【New】"
+    echo -e "  ${YELLOW}9.${RESET} 彻底卸载清理 (清空规则与拦截)"
     echo -e "  ${WHITE}0.${RESET} 退出脚本"
     echo -e "${MAGENTA}=========================================================${RESET}"
     read -p "  请输入选项: " choice
@@ -619,9 +662,9 @@ while true; do
         2) menu_port_config; service_install; pause_and_return ;;
         3) show_status; pause_and_return ;;
         4) service_install; pause_and_return ;;
-        5) service_uninstall; pause_and_return ;;
-        6) [ -f "$LOG_FILE" ] && tail -n 20 "$LOG_FILE" || echo "暂无日志产生"; pause_and_return ;;
-        9) echo -e "${BOLD}尝试重启代理服务以修复规则...${RESET}"; systemctl restart shoes 2>/dev/null || systemctl restart eshoes 2>/dev/null || systemctl restart xray 2>/dev/null; echo -e "${GREEN}服务重启尝试完成。${RESET}"; pause_and_return ;;
+        7) menu_calibration; pause_and_return ;;
+        8) menu_billing_cycle; pause_and_return ;;
+        9) service_uninstall; pause_and_return ;;
         0) exit 0 ;;
         *) sleep 1 ;;
     esac
