@@ -634,9 +634,9 @@ service_uninstall() {
 # ================== 主菜单 ==================
 while true; do
     clear
-    echo -e "${MAGENTA}==========================================================${RESET}"
-    echo -e "${CYAN}         VPS 流量监控管家 5.7 (Smart Edition)                 ${RESET}"
-    echo -e "${MAGENTA}==========================================================${RESET}"
+    echo -e "${MAGENTA}=======================================================${RESET}"
+    echo -e "${CYAN}       VPS 流量监控管家 5.7 (Smart Edition)                ${RESET}"
+    echo -e "${MAGENTA}=======================================================${RESET}"
     echo -e " ${BLUE}系统环境 :${RESET} ${WHITE}${SYS_PRETTY_NAME}${RESET}"
     echo -e " ${BLUE}出海网卡 :${RESET} ${WHITE}${DEFAULT_IFACE} ${YELLOW}(底层防丢机制)${RESET}"
     echo -e " ${BLUE}公网 IPv4:${RESET} ${GREEN}${PUBLIC_IPV4}${RESET}"
@@ -651,7 +651,7 @@ while true; do
     else
         echo -e " ${BLUE}结算周期 :${RESET} ${YELLOW}未设置 (手动重置)${RESET}"
     fi
-    echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
+    echo -e "${MAGENTA}------------------------------------------------------${RESET}"
     echo -e "  ${YELLOW}1.${RESET} 全局流量管理 (设置计费模式与总上限)"
     echo -e "  ${YELLOW}2.${RESET} 端口流量管理 (添加/编辑独立监控规则)"
     echo -e "  ${YELLOW}3.${RESET} 实时流量看板 (查看全局与各端口情况)"
@@ -660,7 +660,7 @@ while true; do
     echo -e "  ${MAGENTA}8.${RESET} 设置计费周期 (每月自动归零并解封)"
     echo -e "  ${YELLOW}9.${RESET} 彻底卸载清理 (清空规则与拦截)"
     echo -e "  ${WHITE}0.${RESET} 退出脚本"
-    echo -e "${MAGENTA}=========================================================${RESET}"
+    echo -e "${MAGENTA}======================================================${RESET}"
     read -p "  请输入选项: " choice
     case "$choice" in
         1) menu_global_config; service_install; pause_and_return ;;
